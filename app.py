@@ -27,7 +27,7 @@ from signals import (
     get_sector, get_market_regime, generate_market_scanner,
     SECTOR_MAP, _bulk_fetch_history, compute_indicators,
     fetch_portfolio_news, UNIVERSE_SOURCES, UNIVERSE_TOTAL,
-    debug_universe_load
+    debug_universe_load, MAX_SCAN_SYMBOLS
 )
 
 # New functions added in signals.py v12+ — imported separately so the app
@@ -2667,7 +2667,7 @@ elif _page == 'sector':
 # ── Universe Scanner ─────────────────────────────────────────────────────────
 elif _page == 'scanner':
     st.markdown(
-        f'<div class="sec">🌌 Universe Scanner — {UNIVERSE_TOTAL:,} Assets</div>',
+        f'<div class="sec">🌌 Universe Scanner — top {min(MAX_SCAN_SYMBOLS, UNIVERSE_TOTAL):,} liquid of {UNIVERSE_TOTAL:,}</div>',
         unsafe_allow_html=True)
 
     # ── Universe source breakdown ─────────────────────────────────────────────

@@ -52,6 +52,12 @@ BENCH_NAME = "S&P 500"      # RS + regime benchmark (display name)
 BENCH_SYM  = "^GSPC"        # S&P 500 index symbol on Yahoo
 CURRENCY   = "$"
 
+# Live scanners fetch at most this many symbols (most-liquid-first + all ETFs).
+# Scanning the full ~4,800-name universe live rate-limits Yahoo on Streamlit
+# Cloud, which is why scanners returned nothing. 800 keeps scans fast/reliable.
+# Raise it after baking us_universe_liquid.csv (run build_us_universe.py).
+MAX_SCAN_SYMBOLS = 800
+
 def _yahoo(sym):
     """Resolve a bare symbol to its Yahoo ticker for the active market.
     For US, share-class dots use Yahoo's dash convention (BRK.B -> BRK-B)."""
@@ -99,6 +105,7 @@ SECTOR_STOCKS    = {}
 SECTOR_MAP       = {}
 UNIVERSE_SOURCES = []   # [(label, loaded_count, skipped_count, error_msg)]
 _seen_symbols    = set()
+UNIVERSE_ORDERED = []   # symbols in CSV (market-cap) order — for bounded scans
 
 
 def _load_one_csv(filename, label, series_filter):
@@ -106,7 +113,7 @@ def _load_one_csv(filename, label, series_filter):
     Load one NSE CSV. Returns (loaded, skipped, error_str).
     Handles: BOM, Windows line endings, mixed encoding, missing columns.
     """
-    global SECTOR_STOCKS, SECTOR_MAP, _seen_symbols
+    global SECTOR_STOCKS, SECTOR_MAP, _seen_symbols, UNIVERSE_ORDERED
 
     filepath = os.path.join(_BASE_DIR, filename)
 
@@ -167,6 +174,7 @@ def _load_one_csv(filename, label, series_filter):
         SECTOR_STOCKS[sector].append(sym)
         SECTOR_MAP[sym] = sector
         _seen_symbols.add(sym)
+        UNIVERSE_ORDERED.append(sym)
         loaded += 1
 
     return loaded, skipped, None     # None = no error
@@ -218,10 +226,46 @@ if not _any_loaded:
     for _sec, _stks in SECTOR_STOCKS.items():
         for _s in _stks:
             SECTOR_MAP[_s] = _sec
+            UNIVERSE_ORDERED.append(_s)
     UNIVERSE_SOURCES = [("Fallback (no CSV found)", len(SECTOR_MAP), 0, None)]
 
 # Total exposed for display
 UNIVERSE_TOTAL = sum(len(v) for v in SECTOR_STOCKS.values())
+
+
+# ETF symbol set — robust ETF detection regardless of how sectors are labelled
+# (sector ETFs like XLK/SMH/GDX carry plain sector names, not "...ETF").
+ETF_SYMBOLS = set()
+try:
+    _etf_fp = os.path.join(_BASE_DIR, "us_etfs.csv")
+    if os.path.exists(_etf_fp):
+        _edf = pd.read_csv(_etf_fp)
+        _ecol = _find_col(_edf.columns, _SYM_CANDIDATES)
+        if _ecol:
+            ETF_SYMBOLS = set(_edf[_ecol].astype(str).str.strip().str.upper())
+except Exception:
+    ETF_SYMBOLS = set()
+
+
+def _is_etf(sym):
+    return sym in ETF_SYMBOLS or SECTOR_MAP.get(sym, "").endswith("ETF")
+
+
+def get_scan_symbols(limit=None):
+    """Bounded, most-liquid-first symbol list for the live scanners.
+
+    The universe CSV is market-cap ordered, so the first N stocks are the most
+    liquid. ALL ETFs are always included (there are few and they're liquid).
+    This keeps each live scan small enough to avoid Yahoo rate-limiting on
+    Streamlit Cloud — the root cause of empty scanner results.
+    """
+    lim = MAX_SCAN_SYMBOLS if limit is None else limit
+    etfs, stocks = [], []
+    for sym in UNIVERSE_ORDERED:
+        (etfs if _is_etf(sym) else stocks).append(sym)
+    if lim and lim > 0:
+        stocks = stocks[:max(0, lim - len(etfs))]
+    return etfs + stocks
 
 
 def get_sector(symbol: str) -> str:
@@ -1396,6 +1440,7 @@ def find_sector_picks(selected_sectors=None, max_per_sector=3):
     all_symbols = []
     for sector in sectors:
         all_symbols.extend(SECTOR_STOCKS.get(sector, []))
+    all_symbols = all_symbols[:MAX_SCAN_SYMBOLS]
     bulk_data = _bulk_fetch_history(all_symbols, period="1y")
 
     for sector in sectors:
@@ -1507,9 +1552,7 @@ def build_telegram_message(signals, sector_df, picks=None):
 
 # ─── Master Universe Scanner — FIX 9: unified engine + liquidity gate ─────────
 def generate_market_scanner():
-    all_symbols = []
-    for sector, stocks in SECTOR_STOCKS.items():
-        all_symbols.extend(stocks)
+    all_symbols = get_scan_symbols()
     bulk_data = _bulk_fetch_history(all_symbols, period="6mo")
     results = []
     for symbol in all_symbols:
@@ -2092,9 +2135,7 @@ def scan_for_traps(min_confidence=55):
         support, resistance, atr, entry, target,
         stop_loss, risk_reward, trend, vol_ratio, supertrend_bullish
     """
-    all_symbols = []
-    for sector, stocks in SECTOR_STOCKS.items():
-        all_symbols.extend(stocks)
+    all_symbols = get_scan_symbols()
 
     # Bulk fetch — single network pass for the whole universe
     bulk_data = _bulk_fetch_history(all_symbols, period="6mo")
@@ -2319,9 +2360,7 @@ def scan_corporate_actions_universe(min_dividend=0.0):
           "scanned"              : int,
         }
     """
-    all_symbols = []
-    for stocks in SECTOR_STOCKS.values():
-        all_symbols.extend(stocks)
+    all_symbols = get_scan_symbols()
 
     actions_map = fetch_bulk_corporate_actions(all_symbols)
 
@@ -3031,9 +3070,7 @@ def scan_for_smc_setups(min_quality="B", action_filter="All"):
     quality_rank = {"A+": 3, "A": 2, "B": 1}
     min_rank = quality_rank.get(min_quality, 1)
 
-    all_symbols = []
-    for stocks in SECTOR_STOCKS.values():
-        all_symbols.extend(stocks)
+    all_symbols = get_scan_symbols()
 
     bulk = _bulk_fetch_history(all_symbols, period="6mo")
 
@@ -3103,9 +3140,7 @@ def scan_for_vcp(min_quality="B", ready_only=False):
     quality_rank = {"A+": 4, "A": 3, "B": 2, "C": 1}
     min_rank = quality_rank.get(min_quality, 2)
 
-    all_symbols = []
-    for stocks in SECTOR_STOCKS.values():
-        all_symbols.extend(stocks)
+    all_symbols = get_scan_symbols()
 
     bulk = _bulk_fetch_history(all_symbols, period="6mo")
 
@@ -3193,9 +3228,7 @@ def scan_relative_strength(top_n=None, min_rating=0):
                 "nifty_returns": {}, "timestamp": datetime.now().strftime("%d %b %Y %H:%M"),
                 "error": "Could not fetch Nifty benchmark data"}
 
-    all_symbols = []
-    for stocks in SECTOR_STOCKS.values():
-        all_symbols.extend(stocks)
+    all_symbols = get_scan_symbols()
 
     bulk = _bulk_fetch_history(all_symbols, period="1y")
 
