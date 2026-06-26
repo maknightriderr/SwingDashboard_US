@@ -247,10 +247,19 @@ DB = "trades_us.db"   # SQLite store for the US app (its OWN DB, separate from N
 # the US app lives in `us_swing`.
 _PG_SCHEMA = "us_swing"
 
+# ⚠️ SECURITY: hardcoded fallback so the app persists out-of-the-box on the
+# provided Neon DB. This password is visible to anyone with repo access — prefer
+# setting DATABASE_URL in Streamlit secrets and ROTATING this password. Secrets
+# and env vars below take precedence over this default.
+_DEFAULT_DATABASE_URL = (
+    "postgresql://neondb_owner:npg_jZxyXU6vRm1P@"
+    "ep-cold-morning-atyjado2.c-9.us-east-1.aws.neon.tech/neondb?sslmode=require"
+)
+
 def _load_pg_params():
     import os
     from urllib.parse import urlparse, parse_qs
-    # 1) DATABASE_URL — single connection string (secrets, then env)
+    # 1) DATABASE_URL — single connection string (secrets, then env, then default)
     url = None
     try:
         url = st.secrets.get("DATABASE_URL", None)
@@ -277,6 +286,13 @@ def _load_pg_params():
     src = dict(sec) if sec else {}
     host = src.get("host") or os.environ.get("PG_HOST")
     if not host:
+        # Last resort: built-in default Neon URL (see security note above).
+        if _DEFAULT_DATABASE_URL:
+            u = urlparse(_DEFAULT_DATABASE_URL); q = parse_qs(u.query)
+            return dict(host=u.hostname, port=u.port or 5432,
+                        dbname=(u.path or "/neondb").lstrip("/") or "neondb",
+                        user=u.username, password=u.password,
+                        sslmode=q.get("sslmode", ["require"])[0], connect_timeout=15)
         return None
     return dict(
         host            = host,
@@ -2132,7 +2148,7 @@ with st.sidebar:
     with st.form("trade_form", clear_on_submit=True):
         s_in   = st.text_input("Stock Symbol",
                                value=erow["stock"] if erow is not None else "",
-                               placeholder="CDSL, IRFC…")
+                               placeholder="AAPL, NVDA…")
         q_in   = st.number_input("Quantity", min_value=1, step=1,
                                  value=int(erow["quantity"]) if erow is not None else 1)
         b_in   = st.number_input("Buy At $", min_value=0.01, step=0.05,
@@ -2763,10 +2779,10 @@ elif _page == 'scanner':
 
     # ── Custom stock input ─────────────────────────────────────────────────────
     with st.expander("➕ Add Custom Stocks to Scan", expanded=False):
-        st.caption("Enter NSE symbols (comma-separated). These are added to the scan universe temporarily.")
+        st.caption("Enter US symbols (comma-separated). These are added to the scan universe temporarily.")
         custom_raw = st.text_area(
             "Custom symbols", value=st.session_state.get("custom_stocks_input",""),
-            placeholder="IRFC, CDSL, SNOWMAN, ZOMATO...",
+            placeholder="AAPL, NVDA, TSLA, SPY...",
             label_visibility="collapsed", height=80)
         if st.button("✅ Apply Custom List"):
             # Store and inject into signals module
@@ -2976,7 +2992,7 @@ elif _page == 'watchlist':
         col_inp, col_btn = st.columns([4, 1])
         with col_inp:
             new_stock = st.text_input(
-                "Stock Ticker", placeholder="e.g., SBIN, TATAMOTORS",
+                "Stock Ticker", placeholder="e.g., AAPL, MSFT",
                 label_visibility="collapsed").upper().strip()
         with col_btn:
             if st.form_submit_button("➕ Add", width="stretch") and new_stock:
@@ -3501,14 +3517,14 @@ elif _page == 'smc':
         sel_sym = st.selectbox("Select stock for SMC analysis", symbol_options,
                                label_visibility="collapsed")
     with sc2:
-        custom_sym = st.text_input("Custom", placeholder="e.g. RELIANCE",
+        custom_sym = st.text_input("Custom", placeholder="e.g. AAPL",
                                    label_visibility="collapsed")
 
     target_sym = (custom_sym.strip().upper() if custom_sym.strip()
                   else (sel_sym if sel_sym != "— Enter custom symbol —" else None))
 
     if not target_sym:
-        st.info("💡 Select a holding or enter any NSE symbol to see its Smart Money structure.")
+        st.info("💡 Select a holding or enter any US symbol to see its Smart Money structure.")
     else:
         with st.spinner(f"Analysing {target_sym} institutional structure…"):
             try:
@@ -4285,7 +4301,7 @@ elif _page == 'alerts':
         ac1, ac2, ac3 = st.columns([2, 1, 1])
         with ac1:
             _al_stock = st.text_input("Stock symbol (NSE)", key="al_stock",
-                                      placeholder="e.g. RELIANCE")
+                                      placeholder="e.g. AAPL")
         with ac2:
             _al_cond = st.selectbox("Condition", ["above", "below"], key="al_cond")
         with ac3:
@@ -4371,7 +4387,7 @@ elif _page == 'alerts':
 elif _page == 'chart':
     st.markdown('<div class="sec">📈 Stock Chart</div>', unsafe_allow_html=True)
     st.caption("Candlestick chart with EMAs, Bollinger Bands, and support/resistance. "
-               "Pick a holding, watchlist stock, or type any NSE symbol.")
+               "Pick a holding, watchlist stock, or type any US symbol.")
 
     # Build symbol options: holdings + watchlist + manual
     hold_syms = sorted(df["stock"].unique().tolist()) if not df.empty else []
@@ -4389,7 +4405,7 @@ elif _page == 'chart':
         else:
             _picked = "— type below —"
     with cc2:
-        _typed = st.text_input("Or NSE symbol", key="chart_typed", placeholder="e.g. TCS")
+        _typed = st.text_input("Or US symbol", key="chart_typed", placeholder="e.g. AAPL")
     with cc3:
         _tf_label = st.selectbox("Timeframe", list(_CHART_TIMEFRAMES.keys()),
                                  index=3, key="chart_tf")
@@ -4522,7 +4538,7 @@ elif _page == 'journal':
     with st.expander("➕ New Journal Entry", expanded=False):
         jc1, jc2, jc3 = st.columns(3)
         with jc1:
-            j_stock = st.text_input("Stock", key="j_stock", placeholder="RELIANCE")
+            j_stock = st.text_input("Stock", key="j_stock", placeholder="AAPL")
             j_date = st.date_input("Trade date", key="j_date")
             j_dir = st.selectbox("Direction", ["Long", "Short"], key="j_dir")
         with jc2:
@@ -4837,8 +4853,8 @@ elif _page == 'ipo':
 
     ic1, ic2 = st.columns([3, 1])
     with ic1:
-        _ipo_sym = st.text_input("Add newly listed stock (NSE symbol)", key="ipo_sym",
-                                 placeholder="e.g. VEDPOWER")
+        _ipo_sym = st.text_input("Add newly listed stock (US symbol)", key="ipo_sym",
+                                 placeholder="e.g. NVDA")
     with ic2:
         st.markdown("<br>", unsafe_allow_html=True)
         if st.button("➕ Track", width="stretch"):
