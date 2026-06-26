@@ -70,10 +70,15 @@ def _yahoo(sym):
 # Symbol and sector columns are auto-detected from the actual file.
 # US universe: prefer the liquid-filtered file (built by build_us_universe.py),
 # else fall back to the full combined stocks+ETFs universe.
+_CSV_CONFIGS = []
+# Your own tickers (us_custom.csv) load FIRST so they're always present and
+# always make it into the bounded scan list, regardless of liquidity ranking.
+if os.path.exists(os.path.join(_BASE_DIR, "us_custom.csv")):
+    _CSV_CONFIGS.append(("us_custom.csv", "US Custom (always scanned)", None))
 if os.path.exists(os.path.join(_BASE_DIR, "us_universe_liquid.csv")):
-    _CSV_CONFIGS = [("us_universe_liquid.csv", "US Liquid (Stocks+ETFs)", None)]
+    _CSV_CONFIGS.append(("us_universe_liquid.csv", "US Liquid (Stocks+ETFs)", None))
 else:
-    _CSV_CONFIGS = [("us_universe.csv", "US All (Stocks+ETFs)", None)]
+    _CSV_CONFIGS.append(("us_universe.csv", "US All (Stocks+ETFs)", None))
 
 # ── Known column name variants (handles whitespace, case, BOM differences) ───
 _SYM_CANDIDATES = ["Symbol", "SYMBOL", "symbol", "Sym", "SYM",
@@ -246,6 +251,18 @@ try:
 except Exception:
     ETF_SYMBOLS = set()
 
+# Custom always-scanned symbols (us_custom.csv) — never dropped by the scan cap.
+CUSTOM_SYMBOLS = set()
+try:
+    _cust_fp = os.path.join(_BASE_DIR, "us_custom.csv")
+    if os.path.exists(_cust_fp):
+        _cdf = pd.read_csv(_cust_fp)
+        _ccol = _find_col(_cdf.columns, _SYM_CANDIDATES)
+        if _ccol:
+            CUSTOM_SYMBOLS = set(_cdf[_ccol].astype(str).str.strip().str.upper())
+except Exception:
+    CUSTOM_SYMBOLS = set()
+
 
 def _is_etf(sym):
     return sym in ETF_SYMBOLS or SECTOR_MAP.get(sym, "").endswith("ETF")
@@ -260,12 +277,18 @@ def get_scan_symbols(limit=None):
     Streamlit Cloud — the root cause of empty scanner results.
     """
     lim = MAX_SCAN_SYMBOLS if limit is None else limit
-    etfs, stocks = [], []
+    custom, etfs, stocks = [], [], []
     for sym in UNIVERSE_ORDERED:
-        (etfs if _is_etf(sym) else stocks).append(sym)
+        if sym in CUSTOM_SYMBOLS:
+            custom.append(sym)            # your tickers: always scanned
+        elif _is_etf(sym):
+            etfs.append(sym)              # ETFs: always scanned
+        else:
+            stocks.append(sym)            # stocks: most-liquid-first, capped
+    pinned = custom + etfs
     if lim and lim > 0:
-        stocks = stocks[:max(0, lim - len(etfs))]
-    return etfs + stocks
+        stocks = stocks[:max(0, lim - len(pinned))]
+    return pinned + stocks
 
 
 def get_sector(symbol: str) -> str:
