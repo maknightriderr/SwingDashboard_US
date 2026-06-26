@@ -1,0 +1,15 @@
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Python Cache
+__pycache__/
+*.pyc
+
+# Environment Variables (for future API keys)
+.env
+
+.streamlit/secrets.toml
+trades_us.db
+__pycache__/

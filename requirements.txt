@@ -1,0 +1,10 @@
+streamlit>=1.40
+pandas>=2.0
+numpy
+yfinance>=0.2.50
+requests
+scipy
+plotly
+streamlit-cookies-controller
+streamlit-autorefresh
+psycopg2-binary

@@ -1,0 +1,130 @@
+Symbol,Name,Sector
+SPY,SPDR S&P 500 ETF Trust,Broad Market ETF
+VOO,Vanguard S&P 500 ETF,Broad Market ETF
+IVV,iShares Core S&P 500 ETF,Broad Market ETF
+VTI,Vanguard Total Stock Market ETF,Broad Market ETF
+QQQ,Invesco QQQ Trust,Broad Market ETF
+QQQM,Invesco NASDAQ 100 ETF,Broad Market ETF
+DIA,SPDR Dow Jones Industrial Average ETF,Broad Market ETF
+IWM,iShares Russell 2000 ETF,Broad Market ETF
+IWB,iShares Russell 1000 ETF,Broad Market ETF
+RSP,Invesco S&P 500 Equal Weight ETF,Broad Market ETF
+VEA,Vanguard FTSE Developed Markets ETF,International ETF
+VWO,Vanguard FTSE Emerging Markets ETF,International ETF
+EFA,iShares MSCI EAFE ETF,International ETF
+EEM,iShares MSCI Emerging Markets ETF,International ETF
+IEFA,iShares Core MSCI EAFE ETF,International ETF
+IEMG,iShares Core MSCI Emerging Markets ETF,International ETF
+FXI,iShares China Large-Cap ETF,International ETF
+MCHI,iShares MSCI China ETF,International ETF
+KWEB,KraneShares CSI China Internet ETF,International ETF
+INDA,iShares MSCI India ETF,International ETF
+EWZ,iShares MSCI Brazil ETF,International ETF
+EWJ,iShares MSCI Japan ETF,International ETF
+EWY,iShares MSCI South Korea ETF,International ETF
+EWT,iShares MSCI Taiwan ETF,International ETF
+EWG,iShares MSCI Germany ETF,International ETF
+EWU,iShares MSCI United Kingdom ETF,International ETF
+VGK,Vanguard FTSE Europe ETF,International ETF
+ACWI,iShares MSCI ACWI ETF,International ETF
+XLK,Technology Select Sector SPDR Fund,Technology
+XLF,Financial Select Sector SPDR Fund,Finance
+XLV,Health Care Select Sector SPDR Fund,Health Care
+XLE,Energy Select Sector SPDR Fund,Energy
+XLI,Industrial Select Sector SPDR Fund,Industrials
+XLY,Consumer Discretionary Select Sector SPDR Fund,Consumer Discretionary
+XLP,Consumer Staples Select Sector SPDR Fund,Consumer Staples
+XLU,Utilities Select Sector SPDR Fund,Utilities
+XLB,Materials Select Sector SPDR Fund,Basic Materials
+XLRE,Real Estate Select Sector SPDR Fund,Real Estate
+XLC,Communication Services Select Sector SPDR Fund,Telecommunications
+SMH,VanEck Semiconductor ETF,Technology
+SOXX,iShares Semiconductor ETF,Technology
+IGV,iShares Expanded Tech-Software Sector ETF,Technology
+VGT,Vanguard Information Technology ETF,Technology
+FTEC,Fidelity MSCI Information Technology ETF,Technology
+SKYY,First Trust Cloud Computing ETF,Technology
+HACK,ETFMG Prime Cyber Security ETF,Technology
+CIBR,First Trust NASDAQ Cybersecurity ETF,Technology
+ROBO,ROBO Global Robotics and Automation ETF,Technology
+BOTZ,Global X Robotics & Artificial Intelligence ETF,Technology
+XBI,SPDR S&P Biotech ETF,Health Care
+IBB,iShares Biotechnology ETF,Health Care
+IHI,iShares U.S. Medical Devices ETF,Health Care
+VHT,Vanguard Health Care ETF,Health Care
+KRE,SPDR S&P Regional Banking ETF,Finance
+KBE,SPDR S&P Bank ETF,Finance
+IAI,iShares U.S. Broker-Dealers & Securities Exchanges ETF,Finance
+VFH,Vanguard Financials ETF,Finance
+XOP,SPDR S&P Oil & Gas Exploration & Production ETF,Energy
+OIH,VanEck Oil Services ETF,Energy
+VDE,Vanguard Energy ETF,Energy
+TAN,Invesco Solar ETF,Energy
+ICLN,iShares Global Clean Energy ETF,Energy
+URA,Global X Uranium ETF,Energy
+XME,SPDR S&P Metals & Mining ETF,Basic Materials
+GDX,VanEck Gold Miners ETF,Basic Materials
+GDXJ,VanEck Junior Gold Miners ETF,Basic Materials
+LIT,Global X Lithium & Battery Tech ETF,Basic Materials
+COPX,Global X Copper Miners ETF,Basic Materials
+ITB,iShares U.S. Home Construction ETF,Consumer Discretionary
+XHB,SPDR S&P Homebuilders ETF,Consumer Discretionary
+XRT,SPDR S&P Retail ETF,Consumer Discretionary
+JETS,U.S. Global Jets ETF,Industrials
+IYT,iShares U.S. Transportation ETF,Industrials
+PAVE,Global X U.S. Infrastructure Development ETF,Industrials
+VNQ,Vanguard Real Estate ETF,Real Estate
+IYR,iShares U.S. Real Estate ETF,Real Estate
+SCHD,Schwab U.S. Dividend Equity ETF,Dividend ETF
+VYM,Vanguard High Dividend Yield ETF,Dividend ETF
+DVY,iShares Select Dividend ETF,Dividend ETF
+NOBL,ProShares S&P 500 Dividend Aristocrats ETF,Dividend ETF
+VIG,Vanguard Dividend Appreciation ETF,Dividend ETF
+VUG,Vanguard Growth ETF,Factor ETF
+VTV,Vanguard Value ETF,Factor ETF
+IWF,iShares Russell 1000 Growth ETF,Factor ETF
+IWD,iShares Russell 1000 Value ETF,Factor ETF
+MTUM,iShares MSCI USA Momentum Factor ETF,Factor ETF
+QUAL,iShares MSCI USA Quality Factor ETF,Factor ETF
+USMV,iShares MSCI USA Min Vol Factor ETF,Factor ETF
+ARKK,ARK Innovation ETF,Thematic ETF
+ARKG,ARK Genomic Revolution ETF,Thematic ETF
+ARKW,ARK Next Generation Internet ETF,Thematic ETF
+ARKQ,ARK Autonomous Technology & Robotics ETF,Thematic ETF
+MAGS,Roundhill Magnificent Seven ETF,Thematic ETF
+TLT,iShares 20+ Year Treasury Bond ETF,Bond ETF
+IEF,iShares 7-10 Year Treasury Bond ETF,Bond ETF
+SHY,iShares 1-3 Year Treasury Bond ETF,Bond ETF
+AGG,iShares Core U.S. Aggregate Bond ETF,Bond ETF
+BND,Vanguard Total Bond Market ETF,Bond ETF
+LQD,iShares iBoxx Investment Grade Corporate Bond ETF,Bond ETF
+HYG,iShares iBoxx High Yield Corporate Bond ETF,Bond ETF
+JNK,SPDR Bloomberg High Yield Bond ETF,Bond ETF
+TIP,iShares TIPS Bond ETF,Bond ETF
+BIL,SPDR Bloomberg 1-3 Month T-Bill ETF,Bond ETF
+GLD,SPDR Gold Shares,Commodity ETF
+IAU,iShares Gold Trust,Commodity ETF
+SLV,iShares Silver Trust,Commodity ETF
+USO,United States Oil Fund,Commodity ETF
+UNG,United States Natural Gas Fund,Commodity ETF
+DBC,Invesco DB Commodity Index Tracking Fund,Commodity ETF
+PDBC,Invesco Optimum Yield Diversified Commodity Strategy ETF,Commodity ETF
+UUP,Invesco DB US Dollar Index Bullish Fund,Commodity ETF
+VXX,iPath Series B S&P 500 VIX Short-Term Futures ETN,Volatility ETF
+UVXY,ProShares Ultra VIX Short-Term Futures ETF,Volatility ETF
+SVXY,ProShares Short VIX Short-Term Futures ETF,Volatility ETF
+VIXY,ProShares VIX Short-Term Futures ETF,Volatility ETF
+TQQQ,ProShares UltraPro QQQ,Leveraged ETF
+SQQQ,ProShares UltraPro Short QQQ,Leveraged ETF
+SPXL,Direxion Daily S&P 500 Bull 3X Shares,Leveraged ETF
+SPXS,Direxion Daily S&P 500 Bear 3X Shares,Leveraged ETF
+UPRO,ProShares UltraPro S&P 500,Leveraged ETF
+SPXU,ProShares UltraPro Short S&P 500,Leveraged ETF
+SOXL,Direxion Daily Semiconductor Bull 3X Shares,Leveraged ETF
+SOXS,Direxion Daily Semiconductor Bear 3X Shares,Leveraged ETF
+TNA,Direxion Daily Small Cap Bull 3X Shares,Leveraged ETF
+TZA,Direxion Daily Small Cap Bear 3X Shares,Leveraged ETF
+LABU,Direxion Daily S&P Biotech Bull 3X Shares,Leveraged ETF
+TMF,Direxion Daily 20+ Year Treasury Bull 3X Shares,Leveraged ETF
+SSO,ProShares Ultra S&P500,Leveraged ETF
+QLD,ProShares Ultra QQQ,Leveraged ETF
