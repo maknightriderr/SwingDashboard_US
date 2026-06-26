@@ -649,7 +649,7 @@ if st.session_state.user_id is None:
             cookie_uid = int(cookies.get("swing_user_id"))
             st.session_state.user_id = cookie_uid
             user_row = db("SELECT username FROM users WHERE id=?",
-                          (cookie_uid,), fetch=True)
+                        
             if user_row:
                 st.session_state.username = user_row[0][0]
                 st.session_state.first_render_done = False  # defer scans
