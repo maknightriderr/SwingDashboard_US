@@ -647,10 +647,13 @@ if st.session_state.user_id is None:
     if cookies and cookies.get("swing_user_id"):
         try:
             cookie_uid = int(cookies.get("swing_user_id"))
-            st.session_state.user_id = cookie_uid
             user_row = db("SELECT username FROM users WHERE id=?",
                           (cookie_uid,), fetch=True)
             if user_row:
+                # Only trust the cookie if the user exists in THIS app's database.
+                # (A leftover cookie from the NSE app points to a user_id that does
+                # not exist in the US DB — don't half-authenticate on it.)
+                st.session_state.user_id = cookie_uid
                 st.session_state.username = user_row[0][0]
                 st.session_state.first_render_done = False  # defer scans
                 st.rerun()
@@ -1945,7 +1948,7 @@ st.markdown(theme_css(theme_t), unsafe_allow_html=True)
 with st.sidebar:
     st.markdown(
         f'<div style="font-size:.85rem;font-weight:800;color:var(--accent);'
-        f'margin-bottom:1rem">👤 {st.session_state.username.upper()}</div>',
+        f'margin-bottom:1rem">👤 {(st.session_state.username or "Trader").upper()}</div>',
         unsafe_allow_html=True)
 
     # ── DB persistence status badge ────────────────────────────────────────────
