@@ -57,6 +57,13 @@ except ImportError:
     scan_relative_strength = None
 
 try:
+    from signals import scan_themes as _scan_themes, THEMES as _THEMES
+    scan_themes = _scan_themes
+except ImportError:
+    scan_themes = None
+    _THEMES = {}
+
+try:
     from signals import (
         fetch_corporate_actions,
         fetch_bulk_corporate_actions,
@@ -669,6 +676,7 @@ for k, v in [("user_id", None), ("username", None), ("edit_id", None), ("close_i
              ("corp_actions_cache", None), ("selected_scanner_sector", "All Sectors"),
              ("custom_stocks_input", ""), ("active_page", "portfolio"),
              ("smc_scan_cache", None), ("vcp_scan_cache", None), ("rs_scan_cache", None),
+            ("theme_scan_cache", None),
              ("etf_scan_cache", None), ("mf_search_results", []),
              ("mf_selected", None), ("mf_compare_list", []),
              ("_earnings_cache", None), ("_ipo_watch", []),
@@ -2085,6 +2093,7 @@ with st.sidebar:
         ],
         "🔄 Market Intelligence": [
             ("🔄 Sector Rotation",   "sector"),
+            ("🎯 Market Themes",     "themes"),
             ("💪 RS Leaders",        "rs"),
             ("🌌 Universe Scanner",  "scanner"),
             ("📊 Market Breadth",    "breadth"),
@@ -2692,6 +2701,81 @@ elif _page == 'signals':
             unsafe_allow_html=True)
 
         render_signals(st.session_state.signals_cache, theme_t)
+
+# ── Market Themes ────────────────────────────────────────────────────────────
+elif _page == 'themes':
+    st.markdown('<div class="sec">🎯 Market Themes — what\'s trending now</div>',
+                unsafe_allow_html=True)
+
+    if scan_themes is None:
+        st.warning("🎯 Market Themes requires the updated **signals.py**. "
+                   "Deploy the new signals.py to enable this tab.", icon="⚠️")
+    else:
+        c1, c2 = st.columns([3, 1])
+        with c1:
+            st.caption("Liquid stocks & ETFs grouped into trending baskets "
+                       "(AI, EV, semis, nuclear, data-center power…), ranked by "
+                       "1-month momentum. Hottest themes float to the top.")
+        with c2:
+            run_themes = st.button("🎯 Scan Themes", width="stretch")
+
+        if run_themes:
+            with st.spinner("🔍 Scanning themes across AI, EV, semis, energy, defense…"):
+                st.session_state.theme_scan_cache = scan_themes(liquid_only=True)
+
+        tdata = st.session_state.get("theme_scan_cache")
+        if not tdata:
+            st.info("💡 Click **🎯 Scan Themes** to see which themes are leading the market right now.")
+        else:
+            themes = tdata.get("themes", [])
+            st.caption(f"Scanned {tdata.get('scanned', 0)} symbols · "
+                       f"{len(themes)} themes · Updated {tdata.get('timestamp', '—')}")
+
+            # ── Theme leaderboard (hottest first) ──────────────────────────────
+            for t in themes:
+                ret = t["avg_ret_1m"]
+                col = "var(--green)" if ret >= 0 else "var(--red)"
+                arrow = "▲" if ret >= 0 else "▼"
+                breadth = t["breadth_up"]
+                st.markdown(
+                    f'<div style="display:flex;align-items:center;gap:1rem;'
+                    f'background:var(--card);border:1px solid var(--border);'
+                    f'border-left:4px solid {col};border-radius:12px;'
+                    f'padding:.8rem 1.1rem;margin-bottom:.5rem;flex-wrap:wrap">'
+                    f'<div style="font-weight:800;font-size:1rem;min-width:230px">{t["name"]}</div>'
+                    f'<div style="font-weight:800;font-size:1.1rem;color:{col};min-width:90px">'
+                    f'{arrow} {ret:+.1f}%<span style="font-size:.65rem;color:var(--muted);'
+                    f'font-weight:600"> 1mo</span></div>'
+                    f'<div style="font-size:.8rem;color:var(--muted);font-weight:600">'
+                    f'{t["count"]} liquid · {breadth}% above 50-EMA · leader '
+                    f'<b style="color:var(--text)">{t["leader"]}</b></div>'
+                    f'</div>',
+                    unsafe_allow_html=True)
+
+                with st.expander(f"View {t['count']} names in {t['name']}"):
+                    rows = []
+                    for m in t["members"]:
+                        rows.append({
+                            "Symbol":  m["stock"],
+                            "Type":    "ETF" if m["is_etf"] else "Stock",
+                            "CMP $":   m["cmp"],
+                            "1W %":    m["ret_1w"],
+                            "1M %":    m["ret_1m"],
+                            "RSI":     m["rsi"],
+                            "Trend":   m["trend"],
+                            "Signal":  m["signal"],
+                            "Vol×":    m["vol_ratio"],
+                        })
+                    tdf = pd.DataFrame(rows)
+                    st.dataframe(
+                        tdf, hide_index=True, width="stretch",
+                        column_config={
+                            "CMP $": st.column_config.NumberColumn("CMP $", format="$%.2f"),
+                            "1W %":  st.column_config.NumberColumn("1W %",  format="%.1f%%"),
+                            "1M %":  st.column_config.NumberColumn("1M %",  format="%.1f%%"),
+                            "RSI":   st.column_config.NumberColumn("RSI",   format="%.0f"),
+                            "Vol×":  st.column_config.NumberColumn("Vol×",  format="%.1f"),
+                        })
 
 # ── Sector Rotation ──────────────────────────────────────────────────────────
 elif _page == 'sector':
