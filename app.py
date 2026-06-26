@@ -1269,9 +1269,10 @@ ul[role="listbox"] li[aria-selected="true"] {{
     background: var(--card) !important; overflow: hidden;
 }}
 
-/* ✦ Smooth fade-in for the whole view on load */
-.block-container > div {{ animation: viewfade .5s ease both; }}
-@keyframes viewfade {{ from {{ opacity: 0; transform: translateY(8px); }} to {{ opacity: 1; transform: none; }} }}
+/* ✦ Subtle slide-in on load — NO opacity fade, so a page switch never shows the
+   previous page through the new one (the old "foggy ghost" effect). */
+.block-container > div {{ animation: viewslide .22s ease both; }}
+@keyframes viewslide {{ from {{ transform: translateY(4px); }} to {{ transform: none; }} }}
 
 /* Respect reduced motion */
 @media (prefers-reduced-motion: reduce) {{
@@ -2731,7 +2732,7 @@ elif _page == 'scanner':
                 st.info("Custom list cleared.")
 
     if st.button("⚡ Execute Global Scan", width="stretch"):
-        with st.spinner(f"Scanning {len(SECTOR_MAP)} tickers..."):
+        with st.spinner(f"Scanning {min(MAX_SCAN_SYMBOLS, len(SECTOR_MAP))} tickers..."):
             sd = generate_market_scanner()
             st.session_state.scanner_cache = sd if (sd is not None and not sd.empty) \
                 else pd.DataFrame()
@@ -3058,7 +3059,7 @@ elif _page == 'traps':
         run_trap_scan = st.button("🪤 Run Trap Scan", width="stretch")
 
     if run_trap_scan:
-        total_sym = len(SECTOR_MAP)
+        total_sym = min(MAX_SCAN_SYMBOLS, len(SECTOR_MAP))
         with st.spinner(f"🔍 Scanning {total_sym} stocks for trap patterns…"):
             st.session_state.trap_scan_cache = scan_for_traps(min_confidence=min_conf)
             trap_data = st.session_state.trap_scan_cache
@@ -3292,7 +3293,7 @@ elif _page == 'corp_actions':
         run_ca_scan = st.button("📅 Scan Corporate Actions", width="stretch")
 
     if run_ca_scan:
-        total_sym = len(SECTOR_MAP)
+        total_sym = min(MAX_SCAN_SYMBOLS, len(SECTOR_MAP))
         with st.spinner(f"Fetching corporate actions for {total_sym} stocks… (may take 60–90s)"):
             st.session_state.corp_actions_cache = scan_corporate_actions_universe()
             ca = st.session_state.corp_actions_cache
@@ -3730,7 +3731,7 @@ elif _page == 'smc':
             run_smc_scan = st.button("🎯 Scan Setups", width="stretch")
 
         if run_smc_scan:
-            with st.spinner(f"Scanning {len(SECTOR_MAP)} stocks for SMC setups…"):
+            with st.spinner(f"Scanning {min(MAX_SCAN_SYMBOLS, len(SECTOR_MAP))} stocks for SMC setups…"):
                 st.session_state.smc_scan_cache = scan_for_smc_setups(
                     min_quality=min_q, action_filter=act_f)
                 sc = st.session_state.smc_scan_cache

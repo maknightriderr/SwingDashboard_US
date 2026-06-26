@@ -2145,67 +2145,71 @@ def scan_for_traps(min_confidence=55):
     liquid_count = 0
 
     for symbol in all_symbols:
-        sector = get_sector(symbol)
-        df  = bulk_data.get(symbol)
-        ind = compute_indicators(symbol, period="6mo", prefetched_df=df)
-        if not ind:
+        try:
+            sector = get_sector(symbol)
+            df  = bulk_data.get(symbol)
+            ind = compute_indicators(symbol, period="6mo", prefetched_df=df)
+            if not ind:
+                continue
+            # Liquidity gate — no point alerting on stocks you can't trade
+            if not ind.get("liquidity_ok", True):
+                continue
+            liquid_count += 1
+
+            cmp = ind["cmp"]
+            atr = ind["atr"]
+
+            # ── Bull Trap alert ───────────────────────────────────────────────────
+            if ind.get("bull_trap") and ind.get("bull_trap_conf", 0) >= min_confidence:
+                # For bull traps: target = current price (exit NOW),
+                # re-entry SL shown so trader knows where to re-enter if wrong
+                _, re_entry_sl, _ = _calc_risk_params(
+                    cmp, atr, ind["resistance"], action="SELL"
+                )
+                bull_traps.append({
+                    "stock":              symbol,
+                    "sector":             sector,
+                    "cmp":                cmp,
+                    "rsi":                ind["rsi"],
+                    "confidence":         ind["bull_trap_conf"],
+                    "detail":             ind["bull_trap_detail"],
+                    "support":            ind["support"],
+                    "resistance":         ind["resistance"],
+                    "atr":                atr,
+                    "re_entry_sl":        re_entry_sl,
+                    "trend":              ind["trend"],
+                    "vol_ratio":          ind["vol_ratio"],
+                    "supertrend_bullish": ind.get("supertrend_bullish"),
+                    "patterns":           " | ".join(ind.get("patterns", []) + ind.get("candlesticks", [])),
+                })
+
+            # ── Bear Trap alert ───────────────────────────────────────────────────
+            if ind.get("bear_trap") and ind.get("bear_trap_conf", 0) >= min_confidence:
+                tgt, sl, rr = _calc_risk_params(
+                    cmp, atr, ind["resistance"], action="PICK"
+                )
+                bear_traps.append({
+                    "stock":              symbol,
+                    "sector":             sector,
+                    "cmp":                cmp,
+                    "rsi":                ind["rsi"],
+                    "confidence":         ind["bear_trap_conf"],
+                    "detail":             ind["bear_trap_detail"],
+                    "support":            ind["support"],
+                    "resistance":         ind["resistance"],
+                    "atr":                atr,
+                    "entry":              round(cmp, 2),
+                    "target":             tgt,
+                    "stop_loss":          sl,
+                    "risk_reward":        rr,
+                    "trend":              ind["trend"],
+                    "vol_ratio":          ind["vol_ratio"],
+                    "supertrend_bullish": ind.get("supertrend_bullish"),
+                    "patterns":           " | ".join(ind.get("patterns", []) + ind.get("candlesticks", [])),
+                })
+
+        except Exception:
             continue
-        # Liquidity gate — no point alerting on stocks you can't trade
-        if not ind.get("liquidity_ok", True):
-            continue
-        liquid_count += 1
-
-        cmp = ind["cmp"]
-        atr = ind["atr"]
-
-        # ── Bull Trap alert ───────────────────────────────────────────────────
-        if ind.get("bull_trap") and ind.get("bull_trap_conf", 0) >= min_confidence:
-            # For bull traps: target = current price (exit NOW),
-            # re-entry SL shown so trader knows where to re-enter if wrong
-            _, re_entry_sl, _ = _calc_risk_params(
-                cmp, atr, ind["resistance"], action="SELL"
-            )
-            bull_traps.append({
-                "stock":              symbol,
-                "sector":             sector,
-                "cmp":                cmp,
-                "rsi":                ind["rsi"],
-                "confidence":         ind["bull_trap_conf"],
-                "detail":             ind["bull_trap_detail"],
-                "support":            ind["support"],
-                "resistance":         ind["resistance"],
-                "atr":                atr,
-                "re_entry_sl":        re_entry_sl,
-                "trend":              ind["trend"],
-                "vol_ratio":          ind["vol_ratio"],
-                "supertrend_bullish": ind.get("supertrend_bullish"),
-                "patterns":           " | ".join(ind.get("patterns", []) + ind.get("candlesticks", [])),
-            })
-
-        # ── Bear Trap alert ───────────────────────────────────────────────────
-        if ind.get("bear_trap") and ind.get("bear_trap_conf", 0) >= min_confidence:
-            tgt, sl, rr = _calc_risk_params(
-                cmp, atr, ind["resistance"], action="PICK"
-            )
-            bear_traps.append({
-                "stock":              symbol,
-                "sector":             sector,
-                "cmp":                cmp,
-                "rsi":                ind["rsi"],
-                "confidence":         ind["bear_trap_conf"],
-                "detail":             ind["bear_trap_detail"],
-                "support":            ind["support"],
-                "resistance":         ind["resistance"],
-                "atr":                atr,
-                "entry":              round(cmp, 2),
-                "target":             tgt,
-                "stop_loss":          sl,
-                "risk_reward":        rr,
-                "trend":              ind["trend"],
-                "vol_ratio":          ind["vol_ratio"],
-                "supertrend_bullish": ind.get("supertrend_bullish"),
-                "patterns":           " | ".join(ind.get("patterns", []) + ind.get("candlesticks", [])),
-            })
 
     # Sort by confidence descending
     bull_traps.sort(key=lambda x: x["confidence"], reverse=True)
