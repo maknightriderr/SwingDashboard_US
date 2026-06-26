@@ -3302,3 +3302,177 @@ def scan_relative_strength(top_n=None, min_rating=0):
         "nifty_returns": bench,
         "timestamp": datetime.now().strftime("%d %b %Y %H:%M"),
     }
+
+
+# ==============================================================================
+#  MARKET THEMES — trending thematic baskets (AI, EV, semis, nuclear, …)
+# ==============================================================================
+# Curated liquid constituents + representative ETFs per theme. Edit freely:
+# add/remove tickers or whole themes. Symbols must resolve on Yahoo (bare US).
+THEMES = {
+    "🤖 Artificial Intelligence": [
+        "NVDA", "MSFT", "GOOGL", "META", "AMD", "AVGO", "PLTR", "SMCI", "MU",
+        "TSM", "ARM", "SNOW", "NOW", "ORCL", "CRM", "AI", "BBAI",
+        "AIQ", "BOTZ", "IGV",            # ETFs
+    ],
+    "💾 Semiconductors": [
+        "NVDA", "AMD", "AVGO", "TSM", "MU", "ASML", "AMAT", "LRCX", "KLAC",
+        "QCOM", "INTC", "MRVL", "ARM", "TXN", "ON", "MCHP",
+        "SMH", "SOXX", "SOXL",           # ETFs
+    ],
+    "⚡ Electric Vehicles": [
+        "TSLA", "RIVN", "LCID", "NIO", "XPEV", "LI", "GM", "F", "BYDDY",
+        "DRIV", "IDRV", "KARS",          # ETFs
+    ],
+    "🔋 Battery & Lithium": [
+        "ALB", "SQM", "LAC", "PLL", "ENVX", "QS", "FREY", "AMPX",
+        "LIT", "BATT",                   # ETFs
+    ],
+    "☢️ Nuclear & Uranium": [
+        "CCJ", "LEU", "OKLO", "SMR", "NNE", "UEC", "DNN", "UUUU", "BWXT",
+        "URA", "URNM", "NLR",            # ETFs
+    ],
+    "🌞 Clean Energy & Solar": [
+        "FSLR", "ENPH", "SEDG", "RUN", "NEE", "BE", "SHLS", "ARRY",
+        "ICLN", "TAN", "PBW",            # ETFs
+    ],
+    "☁️ Cloud & Software": [
+        "MSFT", "CRM", "NOW", "SNOW", "DDOG", "NET", "ORCL", "ADBE", "PANW",
+        "MDB", "TEAM", "WDAY",
+        "IGV", "SKYY", "WCLD",           # ETFs
+    ],
+    "🛡️ Cybersecurity": [
+        "PANW", "CRWD", "ZS", "FTNT", "S", "OKTA", "NET", "CYBR", "QLYS",
+        "CIBR", "HACK", "BUG",           # ETFs
+    ],
+    "🤖 Robotics & Automation": [
+        "ISRG", "ABB", "ROK", "TER", "NVDA", "PATH", "ZBRA", "EMR",
+        "BOTZ", "ROBO", "ARKQ",          # ETFs
+    ],
+    "🛰️ Space & Defense": [
+        "LMT", "RTX", "NOC", "GD", "LHX", "RKLB", "ASTS", "LUNR", "BA",
+        "ITA", "PPA", "ARKX",            # ETFs
+    ],
+    "💊 Biotech & GLP-1": [
+        "LLY", "NVO", "AMGN", "VRTX", "REGN", "MRNA", "GILD", "BIIB", "VKTX",
+        "XBI", "IBB", "ARKG",            # ETFs
+    ],
+    "💳 Fintech & Crypto": [
+        "COIN", "HOOD", "XYZ", "PYPL", "SOFI", "MSTR", "MARA", "RIOT", "AFRM",
+        "FINX", "ARKF", "BITQ",          # ETFs
+    ],
+    "🏗️ Data Center & Power": [
+        "VRT", "ETN", "NVDA", "DLR", "EQIX", "SMCI", "ANET", "PWR", "GEV",
+        "PAVE", "DTCR",                  # ETFs
+    ],
+    "🧬 Quantum Computing": [
+        "IONQ", "RGTI", "QBTS", "QUBT", "IBM", "ARQQ",
+        "QTUM",                          # ETF
+    ],
+}
+
+
+def _period_returns(df):
+    """1-week and 1-month % returns from a daily OHLCV frame."""
+    try:
+        close = df["Close"].dropna()
+        if len(close) < 6:
+            return None, None
+        last = float(close.iloc[-1])
+        w = float(close.iloc[-6])  if len(close) >= 6  else None
+        m = float(close.iloc[-22]) if len(close) >= 22 else float(close.iloc[0])
+        ret_1w = round((last / w - 1) * 100, 2) if w else None
+        ret_1m = round((last / m - 1) * 100, 2) if m else None
+        return ret_1w, ret_1m
+    except Exception:
+        return None, None
+
+
+def scan_themes(liquid_only=True):
+    """Scan all THEMES, returning each theme's liquid members with live metrics
+    plus an aggregate momentum score, sorted hottest-first.
+
+    Returns:
+        {
+          "themes": [ { name, members:[...], count, avg_ret_1m, avg_ret_1w,
+                        breadth_up, leader }, ... ],   # sorted by avg_ret_1m desc
+          "scanned": int, "timestamp": str,
+        }
+    Each member: stock, is_etf, sector, cmp, rsi, trend, ret_1w, ret_1m,
+                 rs_ratio, vol_ratio, above_ema50, signal
+    """
+    # One bulk fetch across all unique theme symbols (small, bounded set).
+    symbols = sorted({s for members in THEMES.values() for s in members})
+    bulk = _bulk_fetch_history(symbols, period="6mo")
+
+    ind_cache, ret_cache = {}, {}
+    for s in symbols:
+        df = bulk.get(s)
+        try:
+            ind = compute_indicators(s, period="6mo", prefetched_df=df)
+        except Exception:
+            ind = None
+        if ind:
+            ind_cache[s] = ind
+            ret_cache[s] = _period_returns(df) if df is not None else (None, None)
+
+    themes_out = []
+    for name, members in THEMES.items():
+        rows = []
+        for s in members:
+            ind = ind_cache.get(s)
+            if not ind:
+                continue
+            if liquid_only and not ind.get("liquidity_ok", True):
+                continue
+            r1w, r1m = ret_cache.get(s, (None, None))
+            ema50 = ind.get("ema50")
+            cmp = ind.get("cmp")
+            above_ema50 = bool(cmp and ema50 and cmp > ema50)
+            # lightweight signal label
+            tr = ind.get("trend", "")
+            if "Uptrend" in tr and above_ema50:
+                sig = "🟢 Strong" if "Strong" in tr else "🟢 Up"
+            elif "Downtrend" in tr:
+                sig = "🔴 Down"
+            else:
+                sig = "🟡 Neutral"
+            rows.append({
+                "stock":       s,
+                "is_etf":      _is_etf(s),
+                "sector":      get_sector(s),
+                "cmp":         cmp,
+                "rsi":         ind.get("rsi"),
+                "trend":       tr,
+                "ret_1w":      r1w,
+                "ret_1m":      r1m,
+                "rs_ratio":    ind.get("rs_ratio"),
+                "vol_ratio":   ind.get("vol_ratio"),
+                "above_ema50": above_ema50,
+                "signal":      sig,
+            })
+        if not rows:
+            continue
+        rets_1m = [r["ret_1m"] for r in rows if r["ret_1m"] is not None]
+        rets_1w = [r["ret_1w"] for r in rows if r["ret_1w"] is not None]
+        avg_1m = round(sum(rets_1m) / len(rets_1m), 2) if rets_1m else 0.0
+        avg_1w = round(sum(rets_1w) / len(rets_1w), 2) if rets_1w else 0.0
+        breadth = round(100 * sum(1 for r in rows if r["above_ema50"]) / len(rows))
+        rows.sort(key=lambda r: (r["ret_1m"] if r["ret_1m"] is not None else -999),
+                  reverse=True)
+        themes_out.append({
+            "name":        name,
+            "members":     rows,
+            "count":       len(rows),
+            "avg_ret_1m":  avg_1m,
+            "avg_ret_1w":  avg_1w,
+            "breadth_up":  breadth,
+            "leader":      rows[0]["stock"] if rows else "—",
+        })
+
+    themes_out.sort(key=lambda t: t["avg_ret_1m"], reverse=True)
+    return {
+        "themes":    themes_out,
+        "scanned":   len(symbols),
+        "timestamp": datetime.now().strftime("%d %b %Y %H:%M"),
+    }
