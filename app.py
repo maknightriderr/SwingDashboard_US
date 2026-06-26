@@ -1,3304 +1,5244 @@
 """
-signals.py v12 — Institutional-Grade Signal Engine
-All v11 scorecard gaps fixed:
-  1. RSI        — adjust=False + explicit 100/0 edge case        (7 → 9)
-  2. MACD       — adjust=False, single-pass crossover, histogram  (6 → 9)
-  3. Bollinger  — bb_pos clamped [0,1], bandwidth + squeeze       (6 → 8)
-  4. ATR        — Wilder's EWM smoothing (matches Zerodha/TV)     (6 → 9)
-  5. Supertrend — numpy array loop, Wilder ATR, mult 2.5          (5 → 9)
-  6. VWAP       — 20-day rolling + price_vs_vwap %                (4 → 8)
-  7. EMA/Trend  — slope check, momentum-fading flag, EMA200 back  (7 → 8)
-  8. Fibonacci  — swing-peak based (scipy), not fixed window      (6 → 8)
-  9. Risk Engine— find_sector_picks + scanner now use unified     (7 → 9)
- 10. Liquidity  — soft gate with liquidity_ok flag (no silent None)(7 → 8)
-All output keys are backward-compatible with app.py.
+Swing Trading Portfolio Dashboard v14
+Fixes vs v13:
+  - Premium theme pack: 6 institutional themes (was 3)
+  - theme_css upgraded: animated title underline, card shimmer/lift, live-pulse
+    badge, focus-glow inputs, P&L row rails, tabular numerals
+  - Tab 9 scorecard updated to signals.py v12 (avg 8.4, every component >= 8)
+  - signals.py v12 already deployed: unified risk engine, Wilder ATR/RSI,
+    numpy Supertrend, 20-day VWAP, swing-peak Fibonacci, MACD histogram
 """
 
-import os
-import yfinance as yf
+import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import numpy as np
-import requests
-import time
-import xml.etree.ElementTree as ET
+import sqlite3
+import yfinance as yf
+import plotly.express as px
+import plotly.graph_objects as go
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from scipy.signal import find_peaks
+import time
+import hashlib
 
-# ==============================================================================
-# 1. MULTI-SOURCE NSE UNIVERSE LOADER
-# ==============================================================================
-#
-# Place CSV files in the SAME directory as signals.py (repo root).
-#
-# Download links (browser → CSV button):
-#  Nifty 500:    nseindia.com/products-services/indices-nifty500-index
-#  Nifty 1000:   nseindia.com/products-services/indices-nifty-indices-nifty1000
-#  Midcap 150:   nseindia.com/products-services/indices-nifty-midcap-150-index
-#  Smallcap 250: nseindia.com/products-services/indices-nifty-smallcap-250-index
-#  Microcap 250: nseindia.com/products-services/indices-nifty-microcap-250-index
-#  All NSE:      nseindia.com/market-data/live-equity-market → Download (EQ series)
-#
-# Supported column variants are auto-detected — no manual editing needed.
-# ==============================================================================
+from signals import (
+    generate_signals, sector_rotation, predict_sector_outlook,
+    find_sector_picks, send_telegram, build_telegram_message,
+    get_sector, get_market_regime, generate_market_scanner,
+    SECTOR_MAP, _bulk_fetch_history, compute_indicators,
+    fetch_portfolio_news, UNIVERSE_SOURCES, UNIVERSE_TOTAL,
+    debug_universe_load, MAX_SCAN_SYMBOLS
+)
 
-# ── Absolute base directory — ALWAYS reliable regardless of cwd ──────────────
-_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# ── MARKET CONFIG (US standalone build) ──────────────────────────────────────
-MARKET     = "US"
-SUFFIX     = ""             # US tickers are bare — no .NS/.BO suffix
-BENCH_NAME = "S&P 500"      # RS + regime benchmark (display name)
-BENCH_SYM  = "^GSPC"        # S&P 500 index symbol on Yahoo
-CURRENCY   = "$"
-
-# Live scanners fetch at most this many symbols (most-liquid-first + all ETFs).
-# Scanning the full ~4,800-name universe live rate-limits Yahoo on Streamlit
-# Cloud, which is why scanners returned nothing. 800 keeps scans fast/reliable.
-# Raise it after baking us_universe_liquid.csv (run build_us_universe.py).
-MAX_SCAN_SYMBOLS = 800
-
-def _yahoo(sym):
-    """Resolve a bare symbol to its Yahoo ticker for the active market.
-    For US, share-class dots use Yahoo's dash convention (BRK.B -> BRK-B)."""
-    clean = sanitize_ticker(sym)
-    if SUFFIX == "":            # US: Yahoo uses '-' for share classes
-        clean = clean.replace(".", "-")
-    return clean + SUFFIX
-
-# ── CSV configs: (filename, label, series_filter or None) ────────────────────
-# Symbol and sector columns are auto-detected from the actual file.
-# US universe: prefer the liquid-filtered file (built by build_us_universe.py),
-# else fall back to the full combined stocks+ETFs universe.
-_CSV_CONFIGS = []
-# Your own tickers (us_custom.csv) load FIRST so they're always present and
-# always make it into the bounded scan list, regardless of liquidity ranking.
-if os.path.exists(os.path.join(_BASE_DIR, "us_custom.csv")):
-    _CSV_CONFIGS.append(("us_custom.csv", "US Custom (always scanned)", None))
-if os.path.exists(os.path.join(_BASE_DIR, "us_universe_liquid.csv")):
-    _CSV_CONFIGS.append(("us_universe_liquid.csv", "US Liquid (Stocks+ETFs)", None))
-else:
-    _CSV_CONFIGS.append(("us_universe.csv", "US All (Stocks+ETFs)", None))
-
-# ── Known column name variants (handles whitespace, case, BOM differences) ───
-_SYM_CANDIDATES = ["Symbol", "SYMBOL", "symbol", "Sym", "SYM",
-                   "NSE Symbol", "NSESymbol"]
-_SEC_CANDIDATES = ["Industry", "INDUSTRY", "industry", "Sector", "SECTOR",
-                   "sector", "Ind", "IND", "IndustryName", "Industry Name"]
-_SER_CANDIDATES = ["Series", "SERIES", "series"]
-
-
-def _norm_cols(df):
-    """Strip whitespace, BOM, and normalise column names in-place."""
-    df.columns = [str(c).strip().lstrip("\ufeff").strip() for c in df.columns]
-    return df
-
-
-def _find_col(df_cols, candidates):
-    """Return first matching column name (exact → case-insensitive)."""
-    col_set   = set(df_cols)
-    upper_map = {c.upper(): c for c in df_cols}
-    for cand in candidates:
-        if cand in col_set:
-            return cand
-        if cand.upper() in upper_map:
-            return upper_map[cand.upper()]
-    return None
-
-
-SECTOR_STOCKS    = {}
-SECTOR_MAP       = {}
-UNIVERSE_SOURCES = []   # [(label, loaded_count, skipped_count, error_msg)]
-_seen_symbols    = set()
-UNIVERSE_ORDERED = []   # symbols in CSV (market-cap) order — for bounded scans
-
-
-def _load_one_csv(filename, label, series_filter):
-    """
-    Load one NSE CSV. Returns (loaded, skipped, error_str).
-    Handles: BOM, Windows line endings, mixed encoding, missing columns.
-    """
-    global SECTOR_STOCKS, SECTOR_MAP, _seen_symbols, UNIVERSE_ORDERED
-
-    filepath = os.path.join(_BASE_DIR, filename)
-
-    # ── 1. File existence check (absolute path) ───────────────────────────────
-    if not os.path.exists(filepath):
-        return 0, 0, f"File not found: {filepath}"
-
-    # ── 2. Read with encoding fallback ────────────────────────────────────────
-    df = None
-    for enc in ("utf-8-sig", "utf-8", "latin-1", "cp1252"):
-        try:
-            df = pd.read_csv(filepath, encoding=enc,
-                             on_bad_lines="skip", low_memory=False)
-            _norm_cols(df)
-            break
-        except Exception:
-            df = None
-
-    if df is None or df.empty:
-        return 0, 0, f"Could not parse {filename}"
-
-    # ── 3. Find symbol column ─────────────────────────────────────────────────
-    sym_col = _find_col(df.columns, _SYM_CANDIDATES)
-    if sym_col is None:
-        return 0, 0, (f"No symbol column in {filename}. "
-                      f"Found: {list(df.columns[:5])}")
-
-    # ── 4. Find sector column (optional) ─────────────────────────────────────
-    sec_col = _find_col(df.columns, _SEC_CANDIDATES)   # None for EQUITY_L
-
-    # ── 5. Apply series filter ────────────────────────────────────────────────
-    if series_filter:
-        ser_col = _find_col(df.columns, _SER_CANDIDATES)
-        if ser_col:
-            df = df[df[ser_col].astype(str).str.strip().str.upper()
-                    .isin([s.upper() for s in series_filter])]
-
-    # ── 6. Load rows ──────────────────────────────────────────────────────────
-    loaded = skipped = 0
-    for _, row in df.iterrows():
-        sym = str(row[sym_col]).strip().upper()
-        if not sym or sym in ("NAN", "SYMBOL", "SYM", ""):
-            continue
-        if sym in _seen_symbols:
-            skipped += 1
-            continue
-
-        # Sector: from column if available, else label
-        if sec_col:
-            sector = str(row[sec_col]).strip()
-            if not sector or sector.upper() in ("NAN", "INDUSTRY", "SECTOR", ""):
-                sector = "Others"
-        else:
-            sector = label          # e.g. "NSE All Listed"
-
-        if sector not in SECTOR_STOCKS:
-            SECTOR_STOCKS[sector] = []
-        SECTOR_STOCKS[sector].append(sym)
-        SECTOR_MAP[sym] = sector
-        _seen_symbols.add(sym)
-        UNIVERSE_ORDERED.append(sym)
-        loaded += 1
-
-    return loaded, skipped, None     # None = no error
-
-
-def debug_universe_load():
-    """
-    Returns a human-readable string showing what was loaded from each CSV,
-    what files were scanned, and any errors. Use in app.py for diagnostics.
-    """
-    lines = [f"🔍 Universe load report — base dir: {_BASE_DIR}"]
-    for filename, label, _ in _CSV_CONFIGS:
-        fp = os.path.join(_BASE_DIR, filename)
-        exists  = os.path.exists(fp)
-        sz      = f"{os.path.getsize(fp):,} bytes" if exists else "—"
-        status  = "✅ found" if exists else "❌ not found"
-        lines.append(f"  {status}  {filename:40s}  {sz}")
-    lines.append(f"\nLoaded sources:")
-    for lbl, n, sk, err in UNIVERSE_SOURCES:
-        if err:
-            lines.append(f"  ❌ {lbl}: {err}")
-        else:
-            lines.append(f"  ✅ {lbl}: {n:,} new symbols, {sk:,} duplicates skipped")
-    lines.append(f"\nTotal universe: {UNIVERSE_TOTAL:,} symbols across "
-                 f"{len(SECTOR_STOCKS):,} sectors")
-    return "\n".join(lines)
-
-
-# ── Run loader at import time ─────────────────────────────────────────────────
-_any_loaded = False
-for _cfg in _CSV_CONFIGS:
-    _fn, _lbl, _sf = _cfg
-    _n, _sk, _err = _load_one_csv(_fn, _lbl, _sf)
-    UNIVERSE_SOURCES.append((_lbl, _n, _sk, _err))
-    if _n > 0:
-        _any_loaded = True
-
-if not _any_loaded:
-    # Hardcoded fallback so app boots without any CSV
-    SECTOR_STOCKS = {
-        "Technology":             ["AAPL","MSFT","NVDA","GOOGL","META"],
-        "Finance":                ["JPM","BAC","WFC","GS","V"],
-        "Health Care":            ["UNH","JNJ","LLY","ABBV","MRK"],
-        "Consumer Discretionary": ["AMZN","TSLA","HD","MCD","NKE"],
-        "Energy":                 ["XOM","CVX","COP","SLB","EOG"],
-        "Industrials":            ["CAT","BA","GE","HON","UPS"],
-        "Broad Market ETF":       ["SPY","QQQ","IWM","DIA","VTI"],
-    }
-    for _sec, _stks in SECTOR_STOCKS.items():
-        for _s in _stks:
-            SECTOR_MAP[_s] = _sec
-            UNIVERSE_ORDERED.append(_s)
-    UNIVERSE_SOURCES = [("Fallback (no CSV found)", len(SECTOR_MAP), 0, None)]
-
-# Total exposed for display
-UNIVERSE_TOTAL = sum(len(v) for v in SECTOR_STOCKS.values())
-
-
-# ETF symbol set — robust ETF detection regardless of how sectors are labelled
-# (sector ETFs like XLK/SMH/GDX carry plain sector names, not "...ETF").
-ETF_SYMBOLS = set()
+# New functions added in signals.py v12+ — imported separately so the app
+# degrades gracefully if an older signals.py is deployed.
 try:
-    _etf_fp = os.path.join(_BASE_DIR, "us_etfs.csv")
-    if os.path.exists(_etf_fp):
-        _edf = pd.read_csv(_etf_fp)
-        _ecol = _find_col(_edf.columns, _SYM_CANDIDATES)
-        if _ecol:
-            ETF_SYMBOLS = set(_edf[_ecol].astype(str).str.strip().str.upper())
-except Exception:
-    ETF_SYMBOLS = set()
+    from signals import scan_for_traps as _scan_for_traps
+    scan_for_traps = _scan_for_traps
+except ImportError:
+    scan_for_traps = None
 
-# Custom always-scanned symbols (us_custom.csv) — never dropped by the scan cap.
-CUSTOM_SYMBOLS = set()
 try:
-    _cust_fp = os.path.join(_BASE_DIR, "us_custom.csv")
-    if os.path.exists(_cust_fp):
-        _cdf = pd.read_csv(_cust_fp)
-        _ccol = _find_col(_cdf.columns, _SYM_CANDIDATES)
-        if _ccol:
-            CUSTOM_SYMBOLS = set(_cdf[_ccol].astype(str).str.strip().str.upper())
+    from signals import scan_for_smc_setups as _scan_for_smc_setups
+    scan_for_smc_setups = _scan_for_smc_setups
+except ImportError:
+    scan_for_smc_setups = None
+
+try:
+    from signals import scan_for_vcp as _scan_for_vcp
+    scan_for_vcp = _scan_for_vcp
+except ImportError:
+    scan_for_vcp = None
+
+try:
+    from signals import scan_relative_strength as _scan_rs
+    scan_relative_strength = _scan_rs
+except ImportError:
+    scan_relative_strength = None
+
+try:
+    from signals import (
+        fetch_corporate_actions,
+        fetch_bulk_corporate_actions,
+        scan_corporate_actions_universe,
+    )
+except ImportError:
+    fetch_corporate_actions        = None
+    fetch_bulk_corporate_actions   = None
+    scan_corporate_actions_universe = None
+
+_TRAP_SCANNER_AVAILABLE = scan_for_traps is not None
+_CORP_ACTIONS_AVAILABLE = fetch_corporate_actions is not None
+_SMC_SCANNER_AVAILABLE  = scan_for_smc_setups is not None
+
+# ── Mutual Fund & ETF module (fully separate from stock/signals logic) ─────────
+try:
+    import funds as _funds
+    _FUNDS_AVAILABLE = True
 except Exception:
-    CUSTOM_SYMBOLS = set()
+    _funds = None
+    _FUNDS_AVAILABLE = False
+
+# ── Performance: @st.cache_data wrappers ──────────────────────────────────────
+# market_regime is global (same for all users) — safe to cache across sessions.
+# TTL 600s = 10 min. This renders the header banner in <100ms on reruns.
+@st.cache_data(ttl=600, show_spinner=False)
+def _cached_market_regime():
+    return get_market_regime()
 
 
-def _is_etf(sym):
-    return sym in ETF_SYMBOLS or SECTOR_MAP.get(sym, "").endswith("ETF")
-
-
-def get_scan_symbols(limit=None):
-    """Bounded, most-liquid-first symbol list for the live scanners.
-
-    The universe CSV is market-cap ordered, so the first N stocks are the most
-    liquid. ALL ETFs are always included (there are few and they're liquid).
-    This keeps each live scan small enough to avoid Yahoo rate-limiting on
-    Streamlit Cloud — the root cause of empty scanner results.
-    """
-    lim = MAX_SCAN_SYMBOLS if limit is None else limit
-    custom, etfs, stocks = [], [], []
-    for sym in UNIVERSE_ORDERED:
-        if sym in CUSTOM_SYMBOLS:
-            custom.append(sym)            # your tickers: always scanned
-        elif _is_etf(sym):
-            etfs.append(sym)              # ETFs: always scanned
-        else:
-            stocks.append(sym)            # stocks: most-liquid-first, capped
-    pinned = custom + etfs
-    if lim and lim > 0:
-        stocks = stocks[:max(0, lim - len(pinned))]
-    return pinned + stocks
-
-
-def get_sector(symbol: str) -> str:
-    clean_symbol = symbol.upper().replace(".NS", "").replace(".BO", "")
-    return SECTOR_MAP.get(clean_symbol, "Others")
-
-
-SECTOR_INDICES = {
-    "Technology": "XLK", "Finance": "XLF", "Health Care": "XLV",
-    "Energy": "XLE", "Industrials": "XLI",
-    "Consumer Discretionary": "XLY", "Consumer Staples": "XLP",
-    "Utilities": "XLU", "Basic Materials": "XLB",
-    "Real Estate": "XLRE", "Telecommunications": "XLC",
-}
-
-TRACKED_INDICES = {
-    "S&P 500": "^GSPC", "Nasdaq": "^IXIC",
-    "Dow": "^DJI", "Russell 2000": "^RUT",
-    "Nasdaq 100": "^NDX", "VIX": "^VIX"
-}
-
-# Fallback symbols for indices that Yahoo sometimes deprecates. If the primary
-# symbol returns nothing, the resilient fetcher retries with these.
-_INDEX_FALLBACKS = {
-    "^GSPC": ["^GSPC", "SPY"],
-    "^IXIC": ["^IXIC", "QQQ"],
-    "^DJI":  ["^DJI", "DIA"],
-    "^RUT":  ["^RUT", "IWM"],
-    "^NDX":  ["^NDX", "QQQ"],
-    "^VIX":  ["^VIX"],
-}
-
-# ─── Data Fetcher ──────────────────────────────────────────────────────────────
-def _fetch_history(ticker, period="1y", interval="1d"):
-    """Fetch OHLCV history for one ticker. Tries Ticker.history() first, then
-    falls back to yf.download() which uses a different endpoint and is often
-    more reliable on cloud hosts. Retries once on transient failure."""
-    for _attempt in range(2):
-        # Method 1: Ticker.history()  — auto_adjust=False gives ACTUAL prices
-        # (matching what a trader sees on their chart), not div/split-adjusted.
+def _get_market_regime_safe():
+    """Wrapper that avoids caching an empty (failed) regime result.
+    If indices came back empty, clear the cache so the next rerun retries."""
+    m = _cached_market_regime()
+    if not m or not m.get("indices"):
+        # Empty/failed — drop the cached empty so next call re-fetches fresh
         try:
-            t = yf.Ticker(ticker)
-            df = t.history(period=period, interval=interval, auto_adjust=False)
-            if df is not None and not df.empty and "Close" in df.columns:
-                return _normalize_ohlcv(df)
+            _cached_market_regime.clear()
         except Exception:
             pass
-        # Method 2: yf.download() fallback (different endpoint)
+        # Try one direct (uncached) fetch right now
         try:
-            df = yf.download(ticker, period=period, interval=interval,
-                             auto_adjust=False, progress=False, threads=False)
-            if df is not None and not df.empty:
-                # download() may return multi-index columns for single ticker
-                if isinstance(df.columns, pd.MultiIndex):
-                    df.columns = df.columns.get_level_values(0)
-                if "Close" in df.columns:
-                    return _normalize_ohlcv(df)
+            m2 = get_market_regime()
+            if m2 and m2.get("indices"):
+                return m2
         except Exception:
             pass
-        time.sleep(0.3)
-    return None
+    return m or {"regime": "Unknown", "indices": {}, "confidence": "—"}
 
+# Price cache: 5-min TTL so KPI cards don't block on every sidebar interaction.
+@st.cache_data(ttl=120, show_spinner=False)
+def _cached_prices(symbols_tuple):
+    """Fetch ACCURATE live prices for a tuple of symbols.
 
-def _normalize_ohlcv(df):
-    """Standardise an OHLCV frame: guaranteed Open/High/Low/Close/Volume cols."""
-    try:
-        result = pd.DataFrame()
-        result["Open"]   = df["Open"]   if "Open"   in df.columns else df["Close"]
-        result["Close"]  = df["Close"]
-        result["High"]   = df["High"]   if "High"   in df.columns else df["Close"]
-        result["Low"]    = df["Low"]    if "Low"    in df.columns else df["Close"]
-        result["Volume"] = df["Volume"] if "Volume" in df.columns else 0
-        result = result.dropna(subset=["Close"]).ffill().bfill()
-        return result if not result.empty else None
-    except Exception:
+    Accuracy notes:
+      • Primary source is fast_info.last_price — the real-time last traded price.
+      • History fallback uses auto_adjust=FALSE so we get the ACTUAL close, not a
+        dividend/split back-adjusted value (auto_adjust=True was making CMP wrong
+        for stocks that recently went ex-dividend or split).
+      • 2-min cache (was 5) so prices are fresher during market hours.
+    Never raises — missing prices just stay absent."""
+    import yfinance as _yf
+    import pandas as _pd
+    prices = {}
+    if not symbols_tuple:
+        return prices
+
+    sym_map = {}   # ticker_ns → original sym
+    for sym in symbols_tuple:
+        clean = str(sym).upper().strip()
+        for sfx in [".NS", ".BO", ".NSE", ".BSE"]:
+            if clean.endswith(sfx):
+                clean = clean[:-len(sfx)]
+        sym_map[clean] = sym
+
+    def _extract_fast_price(t):
+        """Real-time last traded price from fast_info (most accurate source)."""
+        try:
+            fi = t.fast_info
+        except Exception:
+            return None
+        for key in ("last_price", "lastPrice", "regularMarketPrice"):
+            for getter in (lambda: fi.get(key) if hasattr(fi, "get") else None,
+                           lambda: getattr(fi, key, None),
+                           lambda: fi[key] if hasattr(fi, "__getitem__") else None):
+                try:
+                    v = getter()
+                    if v is not None and not _pd.isna(v) and float(v) > 0:
+                        return float(v)
+                except Exception:
+                    pass
         return None
 
-
-def sanitize_ticker(sym):
-    """Strips existing extensions to prevent SNOWMAN.NS.NS"""
-    clean = str(sym).upper().strip()
-    for suffix in [".NS", ".BO", ".NSE", ".BSE"]:
-        if clean.endswith(suffix):
-            clean = clean[:-len(suffix)]
-    return clean
-
-
-def _bulk_fetch_history(symbols, period="1y"):
-    results = {}
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        def fetch_single(sym):
-            if sym.startswith("^"):
-                return sym, _fetch_history(sym, period)
-            df = _fetch_history(_yahoo(sym), period)
-            return sym, df
-
-        future_to_sym = {executor.submit(fetch_single, sym): sym for sym in symbols}
-        for future in as_completed(future_to_sym):
-            sym, df = future.result()
-            if df is not None:
-                results[sym] = df
-    return results
-
-
-# ─── Indicator Cache ──────────────────────────────────────────────────────────
-_IND_CACHE = {}
-_IND_CACHE_TS = {}
-_CACHE_TTL = 900
-
-# ==============================================================================
-# FIX 1+4: Wilder's RSI and ATR with adjust=False and edge-case handling
-# ==============================================================================
-def compute_rsi_wilder(series, period=14):
-    """Wilder's RSI. adjust=False matches TradingView/Zerodha exactly.
-    Explicit 100/0 on all-gain/all-loss streaks instead of silent NaN."""
-    delta = series.diff()
-    gain  = delta.clip(lower=0)
-    loss  = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
-
-    rsi = pd.Series(np.nan, index=series.index, dtype=float)
-    m100 = (avg_loss == 0) & (avg_gain > 0)          # pure uptrend → RSI 100
-    m0   = (avg_gain == 0) & (avg_loss > 0)          # pure downtrend → RSI 0
-    mn   = (avg_gain > 0) & (avg_loss > 0)
-    rsi[m100] = 100.0
-    rsi[m0]   = 0.0
-    rs = avg_gain[mn] / avg_loss[mn]
-    rsi[mn] = 100 - (100 / (1 + rs))
-    return rsi
-
-
-def compute_rsi(series, period=14):
-    rsi = compute_rsi_wilder(series, period)
-    val = rsi.iloc[-1]
-    return round(float(val), 1) if not pd.isna(val) else None
-
-
-def compute_atr_wilder(high, low, close, period=14):
-    """True ATR with Wilder's EWM smoothing — matches Zerodha/TradingView.
-    Returns (true_range_series, atr_series)."""
-    tr = pd.concat([
-        high - low,
-        (high - close.shift()).abs(),
-        (low  - close.shift()).abs()
-    ], axis=1).max(axis=1)
-    atr = tr.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
-    return tr, atr
-
-
-# ─── Divergence Detection ─────────────────────────────────────────────────────
-def detect_rsi_divergence(close, rsi_series, window=40):
-    if len(close) < window or len(rsi_series) < window:
-        return {"bullish_div": False, "bearish_div": False}
-    c = close.iloc[-window:].values
-    r = rsi_series.iloc[-window:].values
-    troughs, _ = find_peaks(-c, distance=5)
-    peaks, _   = find_peaks(c, distance=5)
-    bullish = bearish = False
-    if len(troughs) >= 2:
-        if c[troughs[-1]] < c[troughs[-2]] and r[troughs[-1]] > r[troughs[-2]]:
-            bullish = True
-    if len(peaks) >= 2:
-        if c[peaks[-1]] > c[peaks[-2]] and r[peaks[-1]] < r[peaks[-2]]:
-            bearish = True
-    return {"bullish_div": bullish, "bearish_div": bearish}
-
-
-def detect_macd_divergence(close, macd_line, window=40):
-    if len(close) < window or len(macd_line) < window:
-        return {"bullish_div": False, "bearish_div": False}
-    c = close.iloc[-window:].values
-    m = macd_line.iloc[-window:].values
-    troughs, _ = find_peaks(-c, distance=5)
-    peaks, _   = find_peaks(c, distance=5)
-    bullish = bearish = False
-    if len(troughs) >= 2:
-        if c[troughs[-1]] < c[troughs[-2]] and m[troughs[-1]] > m[troughs[-2]]:
-            bullish = True
-    if len(peaks) >= 2:
-        if c[peaks[-1]] > c[peaks[-2]] and m[peaks[-1]] < m[peaks[-2]]:
-            bearish = True
-    return {"bullish_div": bullish, "bearish_div": bearish}
-
-
-# ─── Chart Pattern Detection (unchanged from v11 — already 7+/10) ─────────────
-def detect_price_patterns(high, low, close, vol, vol_avg):
-    patterns = []
-    if len(close) < 30:
-        return patterns
-
-    cmp    = float(close.iloc[-1])
-    c_vals = close.values
-
-    troughs, _ = find_peaks(-c_vals, distance=8, prominence=c_vals.std() * 0.3)
-    peaks,   _ = find_peaks( c_vals, distance=8, prominence=c_vals.std() * 0.3)
-
-    if len(close) >= 20:
-        recent_h = high.iloc[-20:-1].max()
-        recent_l = low.iloc[-20:-1].min()
-        rng_pct  = (recent_h - recent_l) / recent_l
-        if rng_pct < 0.10:
-            if cmp > recent_h and float(vol.iloc[-1]) > vol_avg * 2.5:
-                patterns.append("🚀 Vol Breakout")
-
-    if len(close) >= 30:
-        pole   = close.iloc[-30:-10]
-        flag   = close.iloc[-10:-1]
-        p_gain = (pole.max() - pole.min()) / (pole.min() + 1e-8)
-        f_drop = (flag.max() - flag.min()) / (flag.max() + 1e-8)
-        if p_gain > 0.08 and f_drop < 0.06 and flag.iloc[-1] < pole.max():
-            if cmp > flag.max() and float(vol.iloc[-1]) > vol_avg * 2.0:
-                patterns.append("🚩 Bull Flag Breakout")
-
-    if len(troughs) >= 2:
-        t1, t2 = troughs[-2], troughs[-1]
-        p1, p2 = c_vals[t1], c_vals[t2]
-        depth_ok    = abs(p1 - p2) / (p1 + 1e-8) < 0.08
-        price_ok    = p2 * 1.00 < cmp < p2 * 1.12
-        vol_confirm = float(vol.iloc[-1]) > vol_avg * 1.2
-        if depth_ok and price_ok and vol_confirm:
-            patterns.append("📉 Double Bottom")
-
-    if len(peaks) >= 2:
-        p1_idx, p2_idx = peaks[-2], peaks[-1]
-        v1, v2 = c_vals[p1_idx], c_vals[p2_idx]
-        if abs(v1 - v2) / (v1 + 1e-8) < 0.08 and v2 * 0.88 < cmp < v2 * 0.99:
-            patterns.append("📈 Double Top")
-
-    if len(peaks) >= 3 and len(troughs) >= 2:
-        p1, p2, p3 = c_vals[peaks[-3]], c_vals[peaks[-2]], c_vals[peaks[-1]]
-        head_valid = p2 > p1 and p2 > p3 and abs(p1 - p3) / (p1 + 1e-8) < 0.06
-        if head_valid:
-            neckline = (c_vals[troughs[-2]] + c_vals[troughs[-1]]) / 2
-            if cmp < neckline * 0.99 and float(vol.iloc[-1]) > vol_avg * 1.3:
-                patterns.append("🏔️ Head & Shoulders (Top)")
-
-    if len(troughs) >= 3 and len(peaks) >= 2:
-        t1, t2, t3 = c_vals[troughs[-3]], c_vals[troughs[-2]], c_vals[troughs[-1]]
-        head_valid = t2 < t1 and t2 < t3 and abs(t1 - t3) / (t1 + 1e-8) < 0.06
-        if head_valid:
-            neckline = (c_vals[peaks[-2]] + c_vals[peaks[-1]]) / 2
-            if cmp > neckline * 1.01 and float(vol.iloc[-1]) > vol_avg * 1.3:
-                patterns.append("🛤️ Inverse H&S (Bottom)")
-
-    if len(close) >= 60:
-        cup_window = close.iloc[-60:-10]
-        handle     = close.iloc[-10:]
-        cup_left   = float(cup_window.iloc[0])
-        cup_right  = float(cup_window.iloc[-1])
-        cup_base   = float(cup_window.min())
-        cup_depth  = (cup_left - cup_base) / (cup_left + 1e-8)
-        rim_match  = abs(cup_left - cup_right) / (cup_left + 1e-8)
-        handle_ret = (float(handle.max()) - float(handle.min())) / (float(handle.max()) + 1e-8)
-        breakout   = cmp > float(handle.max()) * 0.995
-        if (0.10 < cup_depth < 0.40 and rim_match < 0.06 and
-                handle_ret < 0.08 and breakout and float(vol.iloc[-1]) > vol_avg * 1.5):
-            patterns.append("☕ Cup & Handle Breakout")
-
-    return patterns
-
-
-# ─── Candlestick Detection (unchanged from v11 — already 8/10) ────────────────
-def detect_candlesticks(open_p, high, low, close):
-    candles = []
-    if len(close) < 5:
-        return candles
-
-    def _candle(i):
-        o, h, l, c = float(open_p.iloc[i]), float(high.iloc[i]), float(low.iloc[i]), float(close.iloc[i])
-        body = abs(c - o); rng = h - l
-        if rng < 1e-8: return None
-        upper_wick = h - max(o, c); lower_wick = min(o, c) - l
-        bullish = c > o
-        return dict(o=o, h=h, l=l, c=c, body=body, rng=rng,
-                    upper_wick=upper_wick, lower_wick=lower_wick, bullish=bullish)
-
-    c0 = _candle(-1); c1 = _candle(-2)
-    c2 = _candle(-3) if len(close) >= 3 else None
-    if not c0 or not c1:
-        return candles
-
-    if (c0["lower_wick"] >= c0["rng"] * 0.55 and c0["upper_wick"] <= c0["rng"] * 0.15 and c0["body"] >= c0["rng"] * 0.05):
-        candles.append("🔨 Bullish Hammer")
-    if (c0["upper_wick"] >= c0["rng"] * 0.55 and c0["lower_wick"] <= c0["rng"] * 0.15 and c0["body"] >= c0["rng"] * 0.05 and not c0["bullish"]):
-        candles.append("💫 Shooting Star")
-    if c0["body"] <= c0["rng"] * 0.07:
-        candles.append("〰️ Doji (Indecision)")
-    if (not c1["bullish"] and c0["bullish"] and c0["o"] <= c1["c"] and c0["c"] >= c1["o"] and c0["body"] > c1["body"] * 1.0):
-        candles.append("🟩 Bullish Engulfing")
-    if (c1["bullish"] and not c0["bullish"] and c0["o"] >= c1["c"] and c0["c"] <= c1["o"] and c0["body"] > c1["body"] * 1.0):
-        candles.append("🟥 Bearish Engulfing")
-    if (not c1["bullish"] and c0["bullish"] and c0["o"] > c1["c"] and c0["c"] < c1["o"] and c0["body"] < c1["body"] * 0.5):
-        candles.append("🟢 Bullish Harami")
-    if (not c1["bullish"] and c0["bullish"] and c0["o"] < c1["l"] and c0["c"] > (c1["o"] + c1["c"]) / 2 and c0["c"] < c1["o"]):
-        candles.append("🔆 Piercing Line")
-
-    if c2:
-        if (not c2["bullish"] and c2["body"] >= c2["rng"] * 0.5 and c1["body"] <= c1["rng"] * 0.3 and
-                c0["bullish"] and c0["body"] >= c0["rng"] * 0.5 and c0["c"] > (c2["o"] + c2["c"]) / 2):
-            candles.append("🌅 Morning Star")
-        if (c2["bullish"] and c2["body"] >= c2["rng"] * 0.5 and c1["body"] <= c1["rng"] * 0.3 and
-                not c0["bullish"] and c0["body"] >= c0["rng"] * 0.5 and c0["c"] < (c2["o"] + c2["c"]) / 2):
-            candles.append("🌆 Evening Star")
-        if (c2["bullish"] and c1["bullish"] and c0["bullish"] and
-                c1["o"] > c2["o"] and c0["o"] > c1["o"] and c1["c"] > c2["c"] and c0["c"] > c1["c"] and
-                c0["body"] >= c0["rng"] * 0.5 and c1["body"] >= c1["rng"] * 0.5):
-            candles.append("🪖 Three White Soldiers")
-        if (not c2["bullish"] and not c1["bullish"] and not c0["bullish"] and
-                c1["o"] < c2["o"] and c0["o"] < c1["o"] and c1["c"] < c2["c"] and c0["c"] < c1["c"] and
-                c0["body"] >= c0["rng"] * 0.5 and c1["body"] >= c1["rng"] * 0.5):
-            candles.append("🦅 Three Black Crows")
-
-    return candles
-
-
-# ─── Market Regime Detection ──────────────────────────────────────────────────
-_market_regime_cache = {"ts": 0, "data": None}
-
-
-def _fetch_index_history(symbol, period="1y"):
-    """Fetch a single index (^-prefixed) with maximum resilience.
-    Indices on Yahoo are flaky — try the primary symbol then any known
-    fallbacks, each with Ticker.history then yf.download. Returns a
-    normalised OHLC frame or None."""
-    candidates = _INDEX_FALLBACKS.get(symbol, [symbol])
-    if symbol not in candidates:
-        candidates = [symbol] + candidates
-
-    for sym in candidates:
-        for _attempt in range(2):
-            # Method 1: Ticker.history
+    # ── METHOD 1: per-ticker fast_info (LIVE last traded price = most accurate) ─
+    for tk, sym in sym_map.items():
+        base = tk
+        for sfx in [""]:
             try:
-                t = yf.Ticker(sym)
-                df = t.history(period=period, interval="1d", auto_adjust=False)
+                t = _yf.Ticker(base + sfx)
+                v = _extract_fast_price(t)
+                if v is not None and v > 0:
+                    prices[sym] = round(v, 2)
+                    break
+            except Exception:
+                continue
+
+    # ── METHOD 2: batch download for any the live method missed ────────────────
+    # auto_adjust=False → ACTUAL close price (not back-adjusted for div/splits)
+    missing = [tk for tk, sym in sym_map.items() if sym not in prices]
+    if missing:
+        try:
+            data = _yf.download(missing, period="5d", interval="1d",
+                                auto_adjust=False, progress=False,
+                                group_by="ticker", threads=True)
+            if data is not None and not data.empty:
+                for tk in missing:
+                    try:
+                        if len(missing) == 1:
+                            close_ser = data["Close"] if "Close" in data.columns else None
+                        else:
+                            close_ser = (data[tk]["Close"]
+                                         if tk in data.columns.get_level_values(0) else None)
+                        if close_ser is not None:
+                            valid = close_ser.dropna()
+                            if not valid.empty:
+                                prices[sym_map[tk]] = round(float(valid.iloc[-1]), 2)
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+    # ── METHOD 3: per-ticker history fallback (auto_adjust=False) ──────────────
+    for tk, sym in sym_map.items():
+        if sym in prices:
+            continue
+        base = tk
+        for sfx in [""]:
+            try:
+                t = _yf.Ticker(base + sfx)
+                h = t.history(period="5d", interval="1d", auto_adjust=False)
+                if h is not None and not h.empty and "Close" in h.columns:
+                    valid = h["Close"].dropna()
+                    if not valid.empty:
+                        prices[sym] = round(float(valid.iloc[-1]), 2)
+                        break
+            except Exception:
+                continue
+    return prices
+
+# ── Auto-refresh ───────────────────────────────────────────────────────────────
+REFRESH_SEC = 300
+try:
+    from streamlit_autorefresh import st_autorefresh
+    st_autorefresh(interval=REFRESH_SEC * 1000, key="dashboard_autorefresh")
+except ImportError:
+    pass
+
+st.set_page_config(
+    page_title="Swing Dashboard", page_icon="📈",
+    layout="wide", initial_sidebar_state="expanded"
+)
+
+# ── Auth helpers ───────────────────────────────────────────────────────────────
+def make_hash(password):
+    return hashlib.sha256(str.encode(password + "swing_salt_99")).hexdigest()
+
+def verify_hash(password, hashed_pw):
+    return make_hash(password) == hashed_pw
+
+# ── Database ───────────────────────────────────────────────────────────────────
+# Uses Neon DB (serverless Postgres). Neon is reachable from Streamlit Cloud and
+# has no schema-resolution quirks. Connection params are passed as keyword
+# are passed as explicit keyword args to psycopg2 — no URL string parsing.
+# ==============================================================================
+
+DB = "trades_us.db"   # SQLite store for the US app (its OWN DB, separate from NSE)
+
+# ── DATABASE CONNECTION ───────────────────────────────────────────────────────
+# Postgres (e.g. Neon) is OPTIONAL. Provide credentials via Streamlit secrets or
+# environment variables; if none are found the app uses local SQLite (DB above).
+# Preferred: add a single DATABASE_URL secret in Streamlit Cloud → Settings → Secrets:
+#   DATABASE_URL = "postgresql://USER:PASSWORD@HOST/DBNAME?sslmode=require"
+# (A [postgres] section or PG_* env vars are also accepted.)
+#
+# DATA ISOLATION: the US app keeps ALL its tables in a dedicated schema
+# (_PG_SCHEMA below). This lets it safely share the SAME Neon database as the
+# NSE app without their users/trades ever colliding — NSE lives in `public`,
+# the US app lives in `us_swing`.
+_PG_SCHEMA = "us_swing"
+
+# ⚠️ SECURITY: hardcoded fallback so the app persists out-of-the-box on the
+# provided Neon DB. This password is visible to anyone with repo access — prefer
+# setting DATABASE_URL in Streamlit secrets and ROTATING this password. Secrets
+# and env vars below take precedence over this default.
+_DEFAULT_DATABASE_URL = (
+    "postgresql://neondb_owner:npg_jZxyXU6vRm1P@"
+    "ep-cold-morning-atyjado2.c-9.us-east-1.aws.neon.tech/neondb?sslmode=require"
+)
+
+def _load_pg_params():
+    import os
+    from urllib.parse import urlparse, parse_qs
+    # 1) DATABASE_URL — single connection string (secrets, then env, then default)
+    url = None
+    try:
+        url = st.secrets.get("DATABASE_URL", None)
+    except Exception:
+        url = None
+    url = url or os.environ.get("DATABASE_URL")
+    if url:
+        u = urlparse(url)
+        q = parse_qs(u.query)
+        return dict(
+            host            = u.hostname,
+            port            = u.port or 5432,
+            dbname          = (u.path or "/neondb").lstrip("/") or "neondb",
+            user            = u.username,
+            password        = u.password,
+            sslmode         = q.get("sslmode", ["require"])[0],
+            connect_timeout = 15,
+        )
+    # 2) [postgres] section / PG_* env vars
+    try:
+        sec = st.secrets.get("postgres", None)
+    except Exception:
+        sec = None
+    src = dict(sec) if sec else {}
+    host = src.get("host") or os.environ.get("PG_HOST")
+    if not host:
+        # Last resort: built-in default Neon URL (see security note above).
+        if _DEFAULT_DATABASE_URL:
+            u = urlparse(_DEFAULT_DATABASE_URL); q = parse_qs(u.query)
+            return dict(host=u.hostname, port=u.port or 5432,
+                        dbname=(u.path or "/neondb").lstrip("/") or "neondb",
+                        user=u.username, password=u.password,
+                        sslmode=q.get("sslmode", ["require"])[0], connect_timeout=15)
+        return None
+    return dict(
+        host            = host,
+        port            = int(src.get("port") or os.environ.get("PG_PORT", 5432)),
+        dbname          = src.get("dbname") or os.environ.get("PG_DBNAME", "neondb"),
+        user            = src.get("user") or os.environ.get("PG_USER"),
+        password        = src.get("password") or os.environ.get("PG_PASSWORD"),
+        sslmode         = src.get("sslmode") or os.environ.get("PG_SSLMODE", "require"),
+        connect_timeout = 15,
+    )
+
+_PG_PARAMS = _load_pg_params()
+_USE_PG = _PG_PARAMS is not None
+
+try:
+    import psycopg2
+    import psycopg2.extras
+except ImportError:
+    _USE_PG = False
+
+
+def _pg_conn():
+    """Open a Neon Postgres connection using explicit keyword params.
+    Neon is serverless — the compute may be asleep and take a few seconds to
+    wake on the first connection, so we retry several times with backoff."""
+    last_err = None
+    for _attempt in range(4):
+        try:
+            conn = psycopg2.connect(**_PG_PARAMS)
+            conn.autocommit = False
+            # Ensure the US schema exists and scope this session to it, so the
+            # US app never reads/writes the NSE app's public.* tables.
+            with conn.cursor() as _c:
+                _c.execute(f"CREATE SCHEMA IF NOT EXISTS {_PG_SCHEMA}")
+                _c.execute(f"SET search_path TO {_PG_SCHEMA}")
+            conn.commit()
+            return conn
+        except Exception as e:
+            last_err = e
+            time.sleep(1.0 * (_attempt + 1))   # 1s, 2s, 3s backoff for cold start
+    raise last_err
+
+def _q(sql):
+    """Translate SQLite SQL → Postgres '%s' placeholders and 'INSERT OR REPLACE'.
+    Schema qualification is handled directly in db() below."""
+    if not _USE_PG:
+        return sql
+    s = sql.replace("?", "%s")
+    s = s.replace("INSERT OR REPLACE INTO", "INSERT INTO")
+    return s
+
+
+_PG_SCHEMA_PREFIX = "public."
+_PG_TABLES = ("users", "trades", "portfolio_history", "tg_config", "watchlist", "price_alerts", "trade_journal")
+
+
+def _pg_qualify(sql):
+    """No-op now. We rely on 'SET search_path TO public' (which Neon fully
+    supports) rather than hardcoding public. prefixes. Kept as a function so
+    callers don't need to change. Returns sql unchanged."""
+    return sql
+
+
+def db(sql, params=(), fetch=False):
+    if _USE_PG:
+        conn = _pg_conn()
+        cur  = conn.cursor()
+        # Neon fully supports search_path (unlike Supabase pooler). Set it so
+        # bare table names resolve to public.* — this is the standard approach.
+        try:
+            cur.execute(f"SET search_path TO {_PG_SCHEMA}")
+        except Exception:
+            pass
+        # Also qualify explicitly as belt-and-suspenders.
+        pg_sql = _pg_qualify(_q(sql))
+        try:
+            cur.execute(pg_sql, params)
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            cur.close(); conn.close()
+            # Surface the real SQL + error so the cause is visible, not redacted.
+            raise RuntimeError(f"DB error on [{pg_sql}]: {type(e).__name__}: {e}") from e
+        result = cur.fetchall() if fetch else None
+        cur.close(); conn.close()
+        return result
+    else:
+        conn = sqlite3.connect(DB)
+        cur = conn.execute(sql, params)
+        conn.commit()
+        result = cur.fetchall() if fetch else None
+        conn.close()
+        return result
+
+def init_db():
+    if _USE_PG:
+        conn = _pg_conn(); cur = conn.cursor()
+        try:
+            cur.execute(f"SET search_path TO {_PG_SCHEMA}")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+        # Create each table in its own transaction so one failure doesn't
+        # abort the others (a failed statement poisons the whole transaction
+        # in Postgres until rollback).
+        table_ddls = [
+            """CREATE TABLE IF NOT EXISTS users(
+                id SERIAL PRIMARY KEY,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL)""",
+            """CREATE TABLE IF NOT EXISTS trades(
+                id SERIAL PRIMARY KEY, user_id INTEGER, stock TEXT NOT NULL,
+                quantity REAL NOT NULL, buy_at REAL NOT NULL, sell_at REAL,
+                status TEXT DEFAULT 'Open',
+                added_date TEXT DEFAULT to_char(CURRENT_DATE,'YYYY-MM-DD'),
+                closed_date TEXT)""",
+            """CREATE TABLE IF NOT EXISTS portfolio_history(
+                id SERIAL PRIMARY KEY, user_id INTEGER, snapshot_date TEXT,
+                total_invested REAL, current_value REAL)""",
+            """CREATE TABLE IF NOT EXISTS tg_config(
+                user_id INTEGER PRIMARY KEY, bot_token TEXT, chat_id TEXT)""",
+            """CREATE TABLE IF NOT EXISTS watchlist(
+                id SERIAL PRIMARY KEY, user_id INTEGER, stock TEXT NOT NULL,
+                target_price REAL, notes TEXT,
+                added_date TEXT DEFAULT to_char(CURRENT_DATE,'YYYY-MM-DD'))""",
+            """CREATE TABLE IF NOT EXISTS price_alerts(
+                id SERIAL PRIMARY KEY, user_id INTEGER, stock TEXT NOT NULL,
+                condition TEXT NOT NULL, target_price REAL NOT NULL,
+                status TEXT DEFAULT 'Active', note TEXT,
+                created_date TEXT DEFAULT to_char(CURRENT_DATE,'YYYY-MM-DD'),
+                triggered_date TEXT)""",
+            """CREATE TABLE IF NOT EXISTS trade_journal(
+                id SERIAL PRIMARY KEY, user_id INTEGER, stock TEXT NOT NULL,
+                trade_date TEXT, direction TEXT, entry_price REAL, exit_price REAL,
+                setup TEXT, rationale TEXT, emotion TEXT, outcome TEXT,
+                lesson TEXT, rating INTEGER,
+                created_date TEXT DEFAULT to_char(CURRENT_DATE,'YYYY-MM-DD'))""",
+        ]
+        for ddl in table_ddls:
+            try:
+                cur.execute(ddl)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+        cur.close(); conn.close()
+    else:
+        c = sqlite3.connect(DB)
+        c.execute("""CREATE TABLE IF NOT EXISTS users(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS trades(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, stock TEXT NOT NULL,
+            quantity REAL NOT NULL, buy_at REAL NOT NULL, sell_at REAL,
+            status TEXT DEFAULT 'Open', added_date TEXT DEFAULT(date('now')),
+            closed_date TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS portfolio_history(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, snapshot_date TEXT,
+            total_invested REAL, current_value REAL)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS tg_config(
+            user_id INTEGER PRIMARY KEY, bot_token TEXT, chat_id TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS watchlist(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, stock TEXT NOT NULL,
+            target_price REAL, notes TEXT, added_date TEXT DEFAULT(date('now')))""")
+        c.execute("""CREATE TABLE IF NOT EXISTS price_alerts(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, stock TEXT NOT NULL,
+            condition TEXT NOT NULL, target_price REAL NOT NULL,
+            status TEXT DEFAULT 'Active', note TEXT,
+            created_date TEXT DEFAULT(date('now')), triggered_date TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS trade_journal(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, stock TEXT NOT NULL,
+            trade_date TEXT, direction TEXT, entry_price REAL, exit_price REAL,
+            setup TEXT, rationale TEXT, emotion TEXT, outcome TEXT,
+            lesson TEXT, rating INTEGER, created_date TEXT DEFAULT(date('now')))""")
+        c.commit(); c.close()
+
+def register_user(username, password):
+    try:
+        db("INSERT INTO users(username, password_hash) VALUES(?,?)",
+           (username.lower(), make_hash(password)))
+        return True
+    except Exception:
+        return False
+
+def login_user(username, password):
+    user = db("SELECT id, password_hash FROM users WHERE username=?",
+              (username.lower(),), fetch=True)
+    if user and verify_hash(password, user[0][1]):
+        return user[0][0]
+    return None
+
+def get_trades(user_id):
+    if _USE_PG:
+        conn = _pg_conn()
+        try:
+            cur = conn.cursor(); cur.execute(f"SET search_path TO {_PG_SCHEMA}"); cur.close()
+        except Exception:
+            pass
+        df = pd.read_sql_query(
+            "SELECT * FROM trades WHERE user_id=%s ORDER BY id DESC",
+            conn, params=(user_id,))
+        conn.close()
+        return df
+    conn = sqlite3.connect(DB)
+    df = pd.read_sql_query(
+        "SELECT * FROM trades WHERE user_id=? ORDER BY id DESC",
+        conn, params=(user_id,))
+    conn.close()
+    return df
+
+def get_history(user_id):
+    if _USE_PG:
+        conn = _pg_conn()
+        try:
+            cur = conn.cursor(); cur.execute(f"SET search_path TO {_PG_SCHEMA}"); cur.close()
+        except Exception:
+            pass
+        df = pd.read_sql_query(
+            "SELECT * FROM portfolio_history WHERE user_id=%s ORDER BY snapshot_date",
+            conn, params=(user_id,))
+        conn.close()
+        return df
+    conn = sqlite3.connect(DB)
+    df = pd.read_sql_query(
+        "SELECT * FROM portfolio_history WHERE user_id=? ORDER BY snapshot_date",
+        conn, params=(user_id,))
+    conn.close()
+    return df
+
+def get_watchlist(user_id):
+    if _USE_PG:
+        conn = _pg_conn()
+        try:
+            cur = conn.cursor(); cur.execute(f"SET search_path TO {_PG_SCHEMA}"); cur.close()
+        except Exception:
+            pass
+        df = pd.read_sql_query(
+            "SELECT * FROM watchlist WHERE user_id=%s ORDER BY id DESC",
+            conn, params=(user_id,))
+        conn.close()
+        return df
+    conn = sqlite3.connect(DB)
+    df = pd.read_sql_query(
+        "SELECT * FROM watchlist WHERE user_id=? ORDER BY id DESC",
+        conn, params=(user_id,))
+    conn.close()
+    return df
+
+def get_tg_config(user_id):
+    rows = db("SELECT bot_token,chat_id FROM tg_config WHERE user_id=?",
+              (user_id,), fetch=True)
+    return rows[0] if rows else ("", "")
+
+def save_tg_config(user_id, token, chat):
+    if _USE_PG:
+        db("INSERT INTO tg_config(user_id,bot_token,chat_id) VALUES(?,?,?) "
+           "ON CONFLICT(user_id) DO UPDATE SET bot_token=EXCLUDED.bot_token, "
+           "chat_id=EXCLUDED.chat_id",
+           (user_id, token, chat))
+    else:
+        db("INSERT OR REPLACE INTO tg_config(user_id,bot_token,chat_id) VALUES(?,?,?)",
+           (user_id, token, chat))
+
+def add_trade(user_id, stock, qty, buy, sell=None):
+    status = "Closed" if sell else "Open"
+    closed = datetime.now().strftime("%Y-%m-%d") if sell else None
+    db("INSERT INTO trades(user_id,stock,quantity,buy_at,sell_at,status,closed_date) VALUES(?,?,?,?,?,?,?)",
+       (user_id, stock.upper().strip(), qty, buy, sell, status, closed))
+
+def update_trade(tid, user_id, stock, qty, buy, sell, status):
+    closed = datetime.now().strftime("%Y-%m-%d") if status == "Closed" else None
+    db("UPDATE trades SET stock=?,quantity=?,buy_at=?,sell_at=?,status=?,closed_date=? WHERE id=? AND user_id=?",
+       (stock.upper().strip(), qty, buy, sell, status, closed, tid, user_id))
+
+def delete_trade(tid, user_id):
+    db("DELETE FROM trades WHERE id=? AND user_id=?", (tid, user_id))
+
+def close_trade(tid, user_id, sell):
+    db("UPDATE trades SET sell_at=?,status='Closed',closed_date=? WHERE id=? AND user_id=?",
+       (sell, datetime.now().strftime("%Y-%m-%d"), tid, user_id))
+
+def save_snapshot(user_id, invested, value):
+    """Save a daily portfolio snapshot. Non-critical — if it fails (e.g. DB
+    hiccup), it must NOT crash the dashboard, so errors are swallowed."""
+    try:
+        today = datetime.now().strftime("%Y-%m-%d")
+        db("DELETE FROM portfolio_history WHERE snapshot_date=? AND user_id=?", (today, user_id))
+        db("INSERT INTO portfolio_history(user_id,snapshot_date,total_invested,current_value) VALUES(?,?,?,?)",
+           (user_id, today, invested, value))
+    except Exception:
+        pass   # snapshot is non-essential; never block the dashboard on it
+
+def add_watchlist(user_id, stock, target=None, notes=""):
+    db("INSERT INTO watchlist(user_id,stock,target_price,notes) VALUES(?,?,?,?)",
+       (user_id, stock.upper().strip(), target, notes))
+
+def delete_watchlist_item(wid, user_id):
+    db("DELETE FROM watchlist WHERE id=? AND user_id=?", (wid, user_id))
+
+# ── Price Alert helpers ────────────────────────────────────────────────────────
+def add_price_alert(user_id, stock, condition, target_price, note=""):
+    """condition is 'above' or 'below'."""
+    db("INSERT INTO price_alerts(user_id,stock,condition,target_price,note) "
+       "VALUES(?,?,?,?,?)",
+       (user_id, stock.upper().strip(), condition, float(target_price), note))
+
+def get_price_alerts(user_id, status=None):
+    if status:
+        rows = db("SELECT id,stock,condition,target_price,status,note,"
+                  "created_date,triggered_date FROM price_alerts "
+                  "WHERE user_id=? AND status=? ORDER BY id DESC",
+                  (user_id, status), fetch=True)
+    else:
+        rows = db("SELECT id,stock,condition,target_price,status,note,"
+                  "created_date,triggered_date FROM price_alerts "
+                  "WHERE user_id=? ORDER BY id DESC", (user_id,), fetch=True)
+    return rows or []
+
+def delete_price_alert(aid, user_id):
+    db("DELETE FROM price_alerts WHERE id=? AND user_id=?", (aid, user_id))
+
+def trigger_price_alert(aid, user_id):
+    today = datetime.now().strftime("%Y-%m-%d")
+    db("UPDATE price_alerts SET status='Triggered',triggered_date=? "
+       "WHERE id=? AND user_id=?", (today, aid, user_id))
+
+# ── Trade Journal helpers ──────────────────────────────────────────────────────
+def add_journal_entry(user_id, stock, trade_date, direction, entry, exit_p,
+                      setup, rationale, emotion, outcome, lesson, rating):
+    db("INSERT INTO trade_journal(user_id,stock,trade_date,direction,entry_price,"
+       "exit_price,setup,rationale,emotion,outcome,lesson,rating) "
+       "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+       (user_id, stock.upper().strip(), trade_date, direction, entry, exit_p,
+        setup, rationale, emotion, outcome, lesson, rating))
+
+def get_journal_entries(user_id):
+    rows = db("SELECT id,stock,trade_date,direction,entry_price,exit_price,setup,"
+              "rationale,emotion,outcome,lesson,rating,created_date "
+              "FROM trade_journal WHERE user_id=? ORDER BY id DESC",
+              (user_id,), fetch=True)
+    return rows or []
+
+def delete_journal_entry(jid, user_id):
+    db("DELETE FROM trade_journal WHERE id=? AND user_id=?", (jid, user_id))
+
+# ── Session & Cookie Init ──────────────────────────────────────────────────────
+from streamlit_cookies_controller import CookieController
+controller = CookieController(key='app_cookies')
+
+# Initialise DB and record connection status for the sidebar badge
+_DB_STATUS = "sqlite"
+_DB_ERROR = None
+try:
+    init_db()
+    _DB_STATUS = "postgres" if _USE_PG else "sqlite"
+except Exception as _db_e:
+    _DB_ERROR = str(_db_e)
+    # If Postgres was configured but failed, fall back to SQLite so the app
+    # still loads (data won't persist, but the user isn't locked out).
+    if _USE_PG:
+        _USE_PG = False
+        _DB_STATUS = "sqlite_fallback"
+        try:
+            init_db()
+        except Exception:
+            pass
+
+# Ensure session state variables exist
+for k, v in [("user_id", None), ("username", None), ("edit_id", None), ("close_id", None), ("del_id", None),
+             ("last_refresh", None), ("last_auto_scan", 0.0), ("last_slow_scan", 0.0),
+             ("_trade_hash", -1), ("sort_col", "stock"), ("sort_asc", False),
+             ("signals_cache", None), ("sector_cache", None), ("picks_cache", None),
+             ("outlook_cache", None), ("scanner_cache", None), ("trap_scan_cache", None),
+             ("corp_actions_cache", None), ("selected_scanner_sector", "All Sectors"),
+             ("custom_stocks_input", ""), ("active_page", "portfolio"),
+             ("smc_scan_cache", None), ("vcp_scan_cache", None), ("rs_scan_cache", None),
+             ("etf_scan_cache", None), ("mf_search_results", []),
+             ("mf_selected", None), ("mf_compare_list", []),
+             ("_earnings_cache", None), ("_ipo_watch", []),
+             ("first_render_done", False), ("_kickoff_scan", False),
+             ("_scan_stage", "done"), ("_deep_stage", "sector"),
+             ("_deep_running", False), ("_manual_deep_request", False),
+             ("_manual_fast_request", False),
+             ("_run_deep_now", False), ("_deep_progress", "done"),
+             ("fast_interval_sec", 300), ("deep_interval_sec", 900),
+             ("auto_fast", True), ("auto_deep", True),
+             ("filter_status", "All"),
+             ("filter_pnl", "All"), ("search", ""), ("theme", "Obsidian & Gold (Institutional)")]:
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+# ── Auth Gate ──────────────────────────────────────────────────────────────────
+if st.session_state.user_id is None:
+    cookies = controller.getAll()
+
+    if cookies is None:
+        st.info("Loading secure tunnel...")
+        time.sleep(0.5)
+        st.rerun()
+
+    if cookies and cookies.get("swing_user_id"):
+        try:
+            cookie_uid = int(cookies.get("swing_user_id"))
+            user_row = db("SELECT username FROM users WHERE id=?",
+                          (cookie_uid,), fetch=True)
+            if user_row:
+                # Only trust the cookie if the user exists in THIS app's database.
+                # (A leftover cookie from the NSE app points to a user_id that does
+                # not exist in the US DB — don't half-authenticate on it.)
+                st.session_state.user_id = cookie_uid
+                st.session_state.username = user_row[0][0]
+                st.session_state.first_render_done = False  # defer scans
+                st.rerun()
+        except Exception:
+            pass
+
+    st.markdown(
+        "<h1 style='text-align:center;margin-top:5rem'>🔐 Quantitative Swing Dashboard</h1>",
+        unsafe_allow_html=True)
+    st.markdown(
+        "<p style='text-align:center;color:gray'>Secure Multi-Tenant Gateway</p>",
+        unsafe_allow_html=True)
+
+    _, auth_col, _ = st.columns([1, 1.5, 1])
+    with auth_col:
+        tab_login, tab_signup = st.tabs(["Login", "Create Account"])
+
+        with tab_login:
+            with st.form("login_form"):
+                l_user = st.text_input("Username")
+                l_pass = st.text_input("Password", type="password")
+                if st.form_submit_button("Access Terminal", width="stretch"):
+                    uid = login_user(l_user, l_pass)
+                    if uid:
+                        st.session_state.user_id = uid
+                        st.session_state.username = l_user
+                        st.session_state.first_render_done = False  # defer scans
+                        controller.set("swing_user_id", str(uid), max_age=604800)
+                        st.success("Authenticated. Booting Engine...")
+                        time.sleep(1)
+                        st.rerun()
+                    else:
+                        st.error("❌ Invalid Username or Password")
+
+        with tab_signup:
+            with st.form("signup_form"):
+                s_user = st.text_input("New Username")
+                s_pass = st.text_input("New Password", type="password")
+                if st.form_submit_button("Register Account", width="stretch"):
+                    if len(s_user) < 3 or len(s_pass) < 4:
+                        st.error("Username > 3 chars and Password > 4 chars required.")
+                    else:
+                        if register_user(s_user, s_pass):
+                            st.success(f"✅ Account {s_user} registered!")
+                        else:
+                            st.error("❌ Username already exists.")
+    st.stop()
+
+# ==============================================================================
+# MAIN APPLICATION (Only runs if Authenticated)
+# ==============================================================================
+
+# User ID strictly injected into all DB calls below
+UID = st.session_state.user_id
+
+# ── HARDCODED SIDEBAR TOGGLE ───────────────────────────────────────────────────
+# Streamlit's native expand control is unreliable across versions and themes.
+# This injects an always-present floating button that finds and clicks the real
+# (possibly hidden) sidebar toggle via JS. Works on desktop AND mobile.
+components.html("""
+<script>
+(function() {
+    const doc = window.parent.document;
+    if (doc.getElementById('hard-sidebar-toggle')) return;  // inject once
+
+    const btn = doc.createElement('button');
+    btn.id = 'hard-sidebar-toggle';
+    btn.innerHTML = '☰';
+    btn.title = 'Toggle sidebar';
+    btn.style.cssText = [
+        'position:fixed', 'top:10px', 'left:10px', 'z-index:2147483647',
+        'width:42px', 'height:42px', 'border-radius:10px', 'border:none',
+        'background:#d4af37', 'color:#000', 'font-size:20px', 'font-weight:800',
+        'cursor:pointer', 'box-shadow:0 3px 14px rgba(0,0,0,.55)',
+        'display:flex', 'align-items:center', 'justify-content:center',
+        'transition:transform .15s ease'
+    ].join(';');
+    btn.onmouseover = () => btn.style.transform = 'scale(1.08)';
+    btn.onmouseout  = () => btn.style.transform = 'scale(1)';
+
+    btn.onclick = function() {
+        // Try every known selector for the sidebar toggle, in priority order.
+        const selectors = [
+            '[data-testid="stSidebarCollapsedControl"] button',
+            '[data-testid="stSidebarCollapsedControl"]',
+            '[data-testid="collapsedControl"] button',
+            '[data-testid="collapsedControl"]',
+            '[data-testid="stSidebarCollapseButton"] button',
+            '[data-testid="stSidebarCollapseButton"]',
+            '[aria-label="Open sidebar"]',
+            '[aria-label="Close sidebar"]'
+        ];
+        for (const sel of selectors) {
+            const el = doc.querySelector(sel);
+            if (el) { el.click(); return; }
+        }
+        // Last resort: toggle the sidebar width directly
+        const sb = doc.querySelector('[data-testid="stSidebar"]');
+        if (sb) {
+            const hidden = sb.getAttribute('aria-expanded') === 'false'
+                        || sb.style.transform.includes('-');
+            sb.style.transform = hidden ? 'translateX(0)' : 'translateX(-100%)';
+            sb.style.visibility = 'visible';
+        }
+    };
+    doc.body.appendChild(btn);
+})();
+</script>
+""", height=0)
+
+THEMES = {
+    # ── 1. The flagship: obsidian black + champagne gold, private-bank feel ──
+    "Obsidian & Gold (Institutional)": {
+        "bg": "#050608", "card": "rgba(13, 14, 18, 0.85)", "input": "#15171c",
+        "border": "rgba(212, 175, 55, 0.18)",
+        "text": "#fdfdfd", "muted": "#8e8e93",
+        "green": "#10b981", "red": "#ef4444", "yellow": "#d4af37",
+        "blue": "#3b82f6", "accent": "#d4af37", "card2": "#121419",
+        "gradient": "linear-gradient(145deg, rgba(212,175,55,0.04) 0%, rgba(13,14,18,0.95) 35%, #050608 100%)",
+        "glow": "rgba(212, 175, 55, 0.25)",
+        "bg_fx": "radial-gradient(ellipse 80% 50% at 50% -20%, rgba(212,175,55,0.06), transparent)",
+    },
+    # ── 2. Bloomberg-terminal energy: near-black + signal orange ─────────────
+    "Terminal Amber (Bloomberg)": {
+        "bg": "#0a0a0a", "card": "rgba(18, 16, 12, 0.9)", "input": "#1a1813",
+        "border": "rgba(255, 153, 0, 0.16)",
+        "text": "#f5f0e8", "muted": "#9a917f",
+        "green": "#33d17a", "red": "#ff5547", "yellow": "#ff9900",
+        "blue": "#4da6ff", "accent": "#ff9900", "card2": "#161410",
+        "gradient": "linear-gradient(160deg, rgba(255,153,0,0.05) 0%, rgba(18,16,12,0.95) 40%, #0a0a0a 100%)",
+        "glow": "rgba(255, 153, 0, 0.22)",
+        "bg_fx": "radial-gradient(ellipse 70% 45% at 80% -10%, rgba(255,153,0,0.05), transparent)",
+    },
+    # ── 3. Deep sapphire glassmorphism — frosted panels over midnight blue ───
+    "Deep Sapphire (Glass)": {
+        "bg": "#020617", "card": "rgba(15, 23, 42, 0.55)", "input": "#1e293b",
+        "border": "rgba(56, 189, 248, 0.14)",
+        "text": "#f8fafc", "muted": "#94a3b8",
+        "green": "#10b981", "red": "#f43f5e", "yellow": "#f59e0b",
+        "blue": "#0ea5e9", "accent": "#38bdf8", "card2": "rgba(30, 41, 59, 0.45)",
+        "gradient": "linear-gradient(135deg, rgba(56,189,248,0.06) 0%, rgba(15,23,42,0.85) 45%, rgba(2,6,23,0.95) 100%)",
+        "glow": "rgba(56, 189, 248, 0.25)",
+        "bg_fx": "radial-gradient(ellipse 60% 40% at 20% -10%, rgba(56,189,248,0.08), transparent), radial-gradient(ellipse 50% 35% at 90% 10%, rgba(99,102,241,0.05), transparent)",
+    },
+    # ── 4. Emerald quant desk — money green on graphite ──────────────────────
+    "Emerald Quant (Hedge Fund)": {
+        "bg": "#060a08", "card": "rgba(11, 18, 14, 0.88)", "input": "#13201a",
+        "border": "rgba(16, 185, 129, 0.16)",
+        "text": "#f0fdf6", "muted": "#7e9a8c",
+        "green": "#10b981", "red": "#f43f5e", "yellow": "#eab308",
+        "blue": "#22d3ee", "accent": "#34d399", "card2": "#0e1812",
+        "gradient": "linear-gradient(150deg, rgba(16,185,129,0.05) 0%, rgba(11,18,14,0.94) 40%, #060a08 100%)",
+        "glow": "rgba(52, 211, 153, 0.22)",
+        "bg_fx": "radial-gradient(ellipse 75% 50% at 50% -15%, rgba(16,185,129,0.06), transparent)",
+    },
+    # ── 5. Royal violet — premium fintech (Zerodha-dark x Stripe) ────────────
+    "Royal Violet (Fintech)": {
+        "bg": "#08060f", "card": "rgba(18, 13, 30, 0.88)", "input": "#1c1430",
+        "border": "rgba(167, 139, 250, 0.16)",
+        "text": "#faf8ff", "muted": "#9b8fc0",
+        "green": "#34d399", "red": "#fb7185", "yellow": "#fbbf24",
+        "blue": "#818cf8", "accent": "#a78bfa", "card2": "#150f26",
+        "gradient": "linear-gradient(140deg, rgba(167,139,250,0.06) 0%, rgba(18,13,30,0.94) 40%, #08060f 100%)",
+        "glow": "rgba(167, 139, 250, 0.25)",
+        "bg_fx": "radial-gradient(ellipse 65% 45% at 30% -10%, rgba(167,139,250,0.07), transparent), radial-gradient(ellipse 50% 35% at 85% 5%, rgba(244,114,182,0.04), transparent)",
+    },
+    # ── 6. Carbon matrix — monochrome quant, teal data accents ───────────────
+    "Carbon Matrix (Quant)": {
+        "bg": "#09090b", "card": "rgba(18, 18, 20, 0.92)", "input": "#18181b",
+        "border": "rgba(255, 255, 255, 0.07)",
+        "text": "#fafafa", "muted": "#a1a1aa",
+        "green": "#22c55e", "red": "#ff3366", "yellow": "#f59e0b",
+        "blue": "#06b6d4", "accent": "#14b8a6", "card2": "#141416",
+        "gradient": "linear-gradient(180deg, rgba(20,184,166,0.04) 0%, rgba(18,18,20,0.96) 35%, #09090b 100%)",
+        "glow": "rgba(20, 184, 166, 0.20)",
+        "bg_fx": "radial-gradient(ellipse 70% 45% at 50% -15%, rgba(20,184,166,0.05), transparent)",
+    },
+}
+
+# --- Fail-safe to prevent KeyErrors when a saved theme name no longer exists ---
+if st.session_state.theme not in THEMES:
+    st.session_state.theme = "Obsidian & Gold (Institutional)"
+
+def theme_css(t):
+    glow  = t.get("glow", "rgba(255,255,255,0.1)")
+    bg_fx = t.get("bg_fx", "none")
+    return f"""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700&family=JetBrains+Mono:wght@400;500;700&display=swap');
+
+:root {{
+  --bg:{t['bg']}; --card:{t['card']}; --input:{t['input']};
+  --border:{t['border']}; --text:{t['text']}; --muted:{t['muted']};
+  --green:{t['green']}; --red:{t['red']}; --yellow:{t['yellow']};
+  --blue:{t['blue']}; --accent:{t['accent']}; --card2:{t['card2']};
+  --gradient:{t['gradient']}; --glow:{glow};
+}}
+
+/* ═══ Base canvas with ambient light bloom ═══ */
+html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stApp"] {{
+    background: var(--bg) !important; color: var(--text) !important;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif !important;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    font-feature-settings: 'cv02','cv03','cv04','cv11','ss01';
+    letter-spacing: -0.011em;
+    text-rendering: optimizeLegibility;
+}}
+/* Tabular figures — numbers align in neat columns (premium finance look) */
+.sig-meta, .sig-price, .kpi-value, [data-testid="stMetricValue"],
+.dataframe, code, .mono, [data-testid="stMetric"] {{
+    font-feature-settings: 'tnum' 1, 'cv02','cv03';
+    font-variant-numeric: tabular-nums;
+}}
+[data-testid="stAppViewContainer"]::before {{
+    content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 0;
+    background: {bg_fx};
+}}
+[data-testid="stHeader"] {{ background: transparent !important; }}
+#MainMenu, footer, header {{ display: none !important; }}
+.block-container {{ padding-top: 1.5rem; padding-bottom: 3rem; max-width: 96%; }}
+::-webkit-scrollbar {{ width: 6px; height: 6px; }}
+::-webkit-scrollbar-track {{ background: transparent; }}
+::-webkit-scrollbar-thumb {{ background: var(--border); border-radius: 10px; }}
+::-webkit-scrollbar-thumb:hover {{ background: var(--accent); }}
+
+/* Numbers always tabular — institutional data discipline */
+.card .val, table.t td, .sector-tbl td, .sig-meta, .pick-prices {{
+    font-variant-numeric: tabular-nums;
+}}
+
+/* ═══ Title with animated accent underline ═══ */
+.dash-title {{
+    font-size: 2rem; font-weight: 800; padding-bottom: 1rem; margin-bottom: 1.5rem;
+    display: flex; align-items: center; justify-content: space-between;
+    letter-spacing: -0.03em; border-bottom: 1px solid var(--border);
+    position: relative;
+}}
+.dash-title::after {{
+    content: ""; position: absolute; bottom: -1px; left: 0; height: 2px; width: 180px;
+    background: linear-gradient(90deg, var(--accent), transparent);
+    animation: pulse-line 3s ease-in-out infinite;
+}}
+@keyframes pulse-line {{ 0%,100% {{ opacity: .5; width: 180px; }} 50% {{ opacity: 1; width: 280px; }} }}
+.dash-title-text {{
+    background: linear-gradient(to right, var(--text), var(--muted));
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+}}
+.dash-title span.hl {{ color: var(--accent); -webkit-text-fill-color: var(--accent); }}
+
+/* ═══ KPI cards — glass + top shimmer line + lift on hover ═══ */
+.cards {{ display: flex; gap: 1.2rem; flex-wrap: wrap; margin-bottom: 2.5rem; }}
+.card {{
+    background: var(--gradient); border: 1px solid var(--border); border-radius: 16px;
+    padding: 1.5rem; flex: 1; min-width: 160px; position: relative; overflow: hidden;
+    box-shadow: 0 10px 30px -10px rgba(0,0,0,0.55);
+    transition: all .4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+    backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
+}}
+.card::before {{
+    content: ""; position: absolute; top: 0; left: 0; right: 0; height: 1px;
+    background: linear-gradient(90deg, transparent, var(--accent), transparent);
+    opacity: 0; transition: opacity .4s ease;
+}}
+.card:hover {{
+    transform: translateY(-6px);
+    box-shadow: 0 24px 48px -12px rgba(0,0,0,0.7), 0 0 24px var(--glow);
+    border-color: var(--accent);
+}}
+.card:hover::before {{ opacity: 1; }}
+.card .lbl {{
+    font-size: .72rem; text-transform: uppercase; letter-spacing: .15em;
+    color: var(--muted); margin-bottom: .5rem; font-weight: 700;
+}}
+.card .val {{ font-size: 1.6rem; font-weight: 800; color: var(--text); letter-spacing: -0.03em; }}
+.card .sub {{ font-size: .8rem; color: var(--muted); margin-top: .4rem; font-weight: 600; }}
+
+/* ═══ Section headers with gradient rail ═══ */
+.green {{ color: var(--green) !important; }} .red {{ color: var(--red) !important; }}
+.yellow {{ color: var(--yellow) !important; }} .blue {{ color: var(--blue) !important; }}
+.sec {{
+    font-size: .95rem; font-weight: 800; text-transform: uppercase;
+    letter-spacing: .12em; color: var(--text); margin: 2.5rem 0 1.2rem;
+    padding-left: 1rem; position: relative;
+}}
+.sec::before {{
+    content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 4px;
+    border-radius: 4px;
+    background: linear-gradient(180deg, var(--accent), transparent);
+}}
+
+/* ═══ Tables — glass panel + accent header rail + row glow ═══ */
+.tbl-wrap {{
+    overflow-x: auto; background: var(--card); border: 1px solid var(--border);
+    border-radius: 16px; box-shadow: 0 10px 30px -10px rgba(0,0,0,0.55);
+    backdrop-filter: blur(16px); margin-bottom: 1.5rem;
+}}
+table.t, .sector-tbl {{ width: 100%; border-collapse: collapse; font-size: .85rem; }}
+table.t th, .sector-tbl th {{
+    background: var(--card2); color: var(--muted); text-transform: uppercase;
+    letter-spacing: .08em; font-weight: 700; padding: 1.1rem 1rem; text-align: right;
+    border-bottom: 1px solid var(--border); position: sticky; top: 0;
+}}
+table.t th.l, table.t td.l {{ text-align: left; }}
+table.t td, .sector-tbl td {{
+    padding: .95rem 1rem; border-bottom: 1px solid var(--border);
+    text-align: right; color: var(--text); font-weight: 600;
+    transition: background .2s ease;
+}}
+table.t tr:last-child td, .sector-tbl tr:last-child td {{ border-bottom: none; }}
+table.t tr:hover td, .sector-tbl tr:hover td {{
+    background: linear-gradient(90deg, transparent, var(--glow), transparent);
+}}
+table.t tr.row-profit td {{ box-shadow: inset 3px 0 0 var(--green); }}
+table.t tr.row-loss td   {{ box-shadow: inset 3px 0 0 var(--red); }}
+
+/* ═══ Badges with glow ═══ */
+.pos {{ color: var(--green); font-weight: 800; }} .neg {{ color: var(--red); font-weight: 800; }}
+.zero-cell {{ color: var(--muted) !important; }}
+.badge {{
+    display: inline-block; padding: .3rem .8rem; border-radius: 8px;
+    font-size: .68rem; font-weight: 800; text-transform: uppercase; letter-spacing: .08em;
+}}
+.b-open {{ background: color-mix(in srgb, var(--yellow) 10%, transparent); color: var(--yellow);
+    border: 1px solid color-mix(in srgb, var(--yellow) 35%, transparent);
+    box-shadow: 0 0 12px color-mix(in srgb, var(--yellow) 12%, transparent); }}
+.b-cl {{ background: rgba(16,185,129,.1); color: var(--green);
+    border: 1px solid rgba(16,185,129,.35); box-shadow: 0 0 12px rgba(16,185,129,.12); }}
+.b-cll {{ background: rgba(239,68,68,.1); color: var(--red);
+    border: 1px solid rgba(239,68,68,.35); box-shadow: 0 0 12px rgba(239,68,68,.12); }}
+
+/* ═══ Signal / pick / outlook cards — glass + animated entrance ═══ */
+.sig-grid, .pick-grid, .outlook-grid {{
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    gap: 1.5rem; margin-top: 1rem;
+}}
+.sig-card, .pick-card, .outlook-card {{
+    background: var(--card); border: 1px solid var(--border); border-radius: 16px;
+    padding: 1.5rem; transition: all .3s ease; backdrop-filter: blur(16px);
+    box-shadow: 0 10px 20px -5px rgba(0,0,0,0.35);
+    animation: card-in .28s ease both;
+}}
+@keyframes card-in {{ from {{ transform: translateY(8px); }} to {{ transform: none; }} }}
+.sig-card:hover, .pick-card:hover {{
+    transform: translateY(-5px); border-color: var(--accent);
+    box-shadow: 0 18px 36px -8px rgba(0,0,0,0.55), 0 0 20px var(--glow);
+}}
+.sig-card.sell  {{ border-top: 3px solid var(--red); }}
+.sig-card.avg   {{ border-top: 3px solid var(--yellow); }}
+.sig-card.hold  {{ border-top: 3px solid var(--green); }}
+.sig-card.watch {{ border-top: 3px solid var(--muted); }}
+.pick-card      {{ border-top: 3px solid var(--accent); }}
+
+.sig-action {{ font-size: .9rem; font-weight: 800; margin-bottom: .8rem;
+    text-transform: uppercase; letter-spacing: .1em; }}
+.sig-meta, .pick-sector {{ font-size: .8rem; color: var(--muted); font-weight: 600; }}
+.sig-reason, .pick-prices {{ font-size: .88rem; margin-top: 1rem; color: var(--text); line-height: 1.65; }}
+.sig-price, .pick-reason {{
+    font-size: .82rem; margin-top: 1.2rem; padding-top: 1rem;
+    border-top: 1px solid var(--border); font-weight: 600; color: var(--muted);
+}}
+.str-bar {{ height: 4px; border-radius: 2px; margin-top: 1rem; background: var(--input);
+    overflow: hidden; }}
+.str-fill {{ height: 100%; border-radius: 2px; transition: width .8s cubic-bezier(.22,1,.36,1); }}
+.rr-warn {{ font-size: .75rem; color: var(--yellow); font-weight: 700; }}
+.news-item {{
+    padding: .6rem .9rem; border-left: 3px solid var(--accent); margin-bottom: .5rem;
+    font-size: .85rem; background: var(--card2); border-radius: 0 8px 8px 0;
+    transition: all .2s ease;
+}}
+.news-item:hover {{ border-left-width: 6px; background: var(--input); }}
+
+/* ═══ Sidebar, inputs, buttons ═══ */
+[data-testid="stSidebar"] {{
+    background: var(--card) !important; border-right: 1px solid var(--border);
+    padding-top: 1rem;
+}}
+/* CRITICAL FIX — keep the sidebar expand ("maximize") control ALWAYS visible.
+   Streamlit changed this test-id across versions, so we target every known
+   variant. The backdrop-filter was removed from the sidebar above because it
+   created a stacking context that hid this button after collapsing. */
+[data-testid="stSidebarCollapsedControl"],
+[data-testid="collapsedControl"],
+[data-testid="stSidebarCollapseButton"],
+button[kind="headerNoPadding"][data-testid="baseButton-headerNoPadding"] {{
+    display: flex !important; visibility: visible !important; opacity: 1 !important;
+    z-index: 1000000 !important;
+}}
+/* The floating expand control when sidebar is collapsed */
+[data-testid="stSidebarCollapsedControl"],
+[data-testid="collapsedControl"] {{
+    position: fixed !important; top: .55rem !important; left: .55rem !important;
+    background: var(--accent) !important; border-radius: 8px !important;
+    padding: .3rem !important; box-shadow: 0 2px 12px rgba(0,0,0,.5) !important;
+}}
+[data-testid="stSidebarCollapsedControl"] svg,
+[data-testid="collapsedControl"] svg {{
+    color: #000 !important; fill: #000 !important; width: 1.5rem; height: 1.5rem;
+}}
+[data-testid="stSidebarCollapseButton"] svg {{ color: var(--text) !important; }}
+/* The Streamlit top header bar can overlap the control — keep it transparent
+   and non-blocking so the expand button is always clickable. */
+[data-testid="stHeader"] {{
+    background: transparent !important; z-index: 1 !important;
+}}
+/* Ensure dataframes scroll internally (both axes) and never clip results */
+[data-testid="stDataFrame"] {{ overflow: auto !important; }}
+[data-testid="stDataFrame"] > div {{ overflow: auto !important; max-width: 100% !important; }}
+.stDataFrame [data-testid="stDataFrameResizable"] {{ overflow: auto !important; }}
+/* Mobile: bigger tap target, sidebar takes most of the screen when open */
+@media (max-width: 768px) {{
+    [data-testid="stSidebarCollapsedControl"],
+    [data-testid="collapsedControl"] {{
+        top: .5rem !important; left: .5rem !important;
+        padding: .45rem !important; transform: scale(1.2);
+    }}
+    [data-testid="stSidebar"] {{ min-width: 82vw !important; }}
+}}
+div[data-baseweb="input"], div[data-baseweb="select"],
+[data-testid="stNumberInputContainer"] {{
+    background-color: var(--input) !important; border: 1px solid var(--border) !important;
+    border-radius: 10px !important; transition: border-color .2s ease !important;
+}}
+div[data-baseweb="input"]:focus-within, div[data-baseweb="select"]:focus-within,
+[data-testid="stNumberInputContainer"]:focus-within {{
+    border-color: var(--accent) !important; box-shadow: 0 0 0 2px var(--glow) !important;
+}}
+div[data-baseweb="input"] input, [data-testid="stNumberInputContainer"] input {{
+    color: var(--text) !important; -webkit-text-fill-color: var(--text) !important;
+    background-color: transparent !important;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif !important; font-weight: 600 !important;
+}}
+button[data-testid="stNumberInputStepDown"], button[data-testid="stNumberInputStepUp"] {{
+    background-color: var(--card2) !important; color: var(--text) !important; border: none !important;
+}}
+div[role="listbox"] {{ background-color: var(--card2) !important;
+    border: 1px solid var(--border) !important; border-radius: 10px !important; }}
+ul[role="listbox"] li {{ color: var(--text) !important; font-weight: 500 !important; }}
+ul[role="listbox"] li[aria-selected="true"] {{
+    background-color: var(--accent) !important; color: #000 !important; font-weight: 800 !important; }}
+
+.stButton>button {{
+    background: var(--card2) !important; border: 1px solid var(--border) !important;
+    color: var(--text) !important; border-radius: 10px !important; font-weight: 700 !important;
+    letter-spacing: .05em !important; padding: .6rem 1.2rem !important;
+    transition: all .3s ease !important;
+}}
+.stButton>button:hover {{
+    border-color: var(--accent) !important; background: var(--accent) !important;
+    color: #000 !important; box-shadow: 0 0 24px var(--glow) !important;
+    transform: translateY(-1px) scale(1.01);
+}}
+
+/* ═══ Tabs — underline glide ═══ */
+.stTabs [data-baseweb="tab-list"] {{
+    background: transparent; gap: 2.2rem; padding: 0 .5rem;
+    border-bottom: 1px solid var(--border);
+}}
+.stTabs [data-baseweb="tab"] {{
+    background: transparent; color: var(--muted); font-weight: 700; padding: 1.2rem 0;
+    border: none; border-bottom: 3px solid transparent; text-transform: uppercase;
+    letter-spacing: .08em; font-size: .82rem; transition: all .3s ease;
+}}
+.stTabs [data-baseweb="tab"]:hover {{ color: var(--text); }}
+.stTabs [aria-selected="true"] {{
+    background: transparent !important; color: var(--text) !important;
+    border-bottom-color: var(--accent) !important;
+    text-shadow: 0 0 18px var(--glow);
+}}
+
+/* ═══ Expanders ═══ */
+[data-testid="stExpander"] {{
+    background-color: var(--card) !important; border: 1px solid var(--border) !important;
+    border-radius: 14px !important; margin-bottom: .8rem !important;
+    backdrop-filter: blur(12px);
+}}
+[data-testid="stExpander"] summary p {{ font-weight: 700 !important; color: var(--text) !important; }}
+
+/* ═══ Regime banner — live pulse dot + glass ═══ */
+.refresh-badge {{
+    display: inline-flex; align-items: center; gap: .5rem;
+    background: rgba(16, 185, 129, 0.1); color: var(--green);
+    padding: .4rem 1rem; border-radius: 30px; font-size: .72rem; font-weight: 800;
+    border: 1px solid rgba(16, 185, 129, 0.4); letter-spacing: .1em;
+    text-transform: uppercase; box-shadow: 0 0 15px rgba(16, 185, 129, 0.2);
+}}
+.refresh-badge::before {{
+    content: ""; width: 7px; height: 7px; border-radius: 50%;
+    background: var(--green); animation: live-pulse 1.8s ease-in-out infinite;
+}}
+@keyframes live-pulse {{
+    0%, 100% {{ opacity: 1; box-shadow: 0 0 0 0 rgba(16,185,129,.5); }}
+    50% {{ opacity: .6; box-shadow: 0 0 0 5px rgba(16,185,129,0); }}
+}}
+.regime-banner {{
+    border-radius: 16px; padding: 1.2rem 1.8rem; display: flex; align-items: center;
+    gap: 1.2rem; margin-bottom: 2.5rem; flex-wrap: wrap;
+    box-shadow: 0 15px 35px -10px rgba(0,0,0,0.6); border: 1px solid var(--border);
+    backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
+}}
+
+/* ════════════════════════════════════════════════════════════════════
+   ✦ PREMIUM POLISH LAYER — refined typography, buttons, inputs, sidebar
+   ════════════════════════════════════════════════════════════════════ */
+
+/* Display serif for major headings — adds an editorial, private-bank feel.
+   (Fraunces is already loaded in the main @import at the top of this stylesheet.) */
+.dash-title, .sec {{
+    font-family: 'Fraunces', Georgia, serif !important;
+    font-weight: 600 !important; letter-spacing: -0.02em !important;
+}}
+
+/* Section headers get a refined gold tick + tighter rhythm */
+.sec {{
+    font-size: 1.35rem !important; font-weight: 600 !important;
+    margin: 1.8rem 0 1.1rem !important; padding-left: .9rem !important;
+    position: relative; line-height: 1.2;
+}}
+.sec::before {{
+    content: ""; position: absolute; left: 0; top: 50%; transform: translateY(-50%);
+    width: 4px; height: 70%; border-radius: 3px;
+    background: linear-gradient(180deg, var(--accent), transparent);
+}}
+
+/* ✦ Buttons — premium gradient, lift, gold glow on hover */
+.stButton > button, .stDownloadButton > button {{
+    background: var(--card2) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: 10px !important;
+    color: var(--text) !important;
+    font-weight: 600 !important; font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif !important;
+    letter-spacing: -0.01em !important;
+    transition: all .25s cubic-bezier(0.175,0.885,0.32,1.275) !important;
+}}
+.stButton > button:hover, .stDownloadButton > button:hover {{
+    border-color: var(--accent) !important;
+    color: var(--accent) !important;
+    transform: translateY(-2px) !important;
+    box-shadow: 0 8px 24px -8px var(--glow) !important;
+}}
+.stButton > button:active, .stDownloadButton > button:active {{
+    transform: translateY(0) !important;
+}}
+/* Primary buttons (form submit) get the gold fill */
+.stButton > button[kind="primary"], .stForm button[kind="primaryFormSubmit"] {{
+    background: linear-gradient(145deg, var(--accent), var(--accent)) !important;
+    color: var(--bg) !important; border: none !important;
+    box-shadow: 0 4px 20px -6px var(--glow) !important;
+}}
+.stButton > button[kind="primary"]:hover {{
+    color: var(--bg) !important; filter: brightness(1.08);
+}}
+
+/* ✦ Inputs / selects — frosted with gold focus ring */
+.stTextInput input, .stNumberInput input, .stDateInput input,
+[data-baseweb="select"] > div, [data-baseweb="input"] > div {{
+    background: var(--card2) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: 10px !important;
+    color: var(--text) !important;
+    transition: border-color .2s, box-shadow .2s !important;
+}}
+.stTextInput input:focus, .stNumberInput input:focus, .stDateInput input:focus {{
+    border-color: var(--accent) !important;
+    box-shadow: 0 0 0 3px var(--glow) !important;
+}}
+
+/* ✦ Tabs — underline slides, gold active */
+.stTabs [data-baseweb="tab-list"] {{ gap: .3rem; border-bottom: 1px solid var(--border); }}
+.stTabs [data-baseweb="tab"] {{
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif !important;
+    font-weight: 600 !important; color: var(--muted) !important;
+    border-radius: 8px 8px 0 0 !important; transition: color .2s !important;
+}}
+.stTabs [aria-selected="true"] {{ color: var(--accent) !important; }}
+.stTabs [data-baseweb="tab-highlight"] {{ background: var(--accent) !important; }}
+
+/* ✦ Sidebar — deeper glass, refined nav radio */
+[data-testid="stSidebar"] {{
+    background: linear-gradient(180deg, rgba(0,0,0,.25), transparent), var(--card) !important;
+    border-right: 1px solid var(--border) !important;
+    backdrop-filter: blur(24px) !important; -webkit-backdrop-filter: blur(24px) !important;
+}}
+[data-testid="stSidebar"] .stRadio label {{
+    transition: all .2s !important; border-radius: 8px !important;
+    padding: .15rem .4rem !important;
+}}
+[data-testid="stSidebar"] .stRadio label:hover {{
+    background: var(--glow) !important;
+}}
+
+/* ✦ Metric cards (st.metric) — give them the glass treatment */
+[data-testid="stMetric"] {{
+    background: var(--gradient) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: 14px !important; padding: 1rem 1.2rem !important;
+    box-shadow: 0 8px 24px -12px rgba(0,0,0,.5) !important;
+    transition: transform .3s, border-color .3s !important;
+}}
+[data-testid="stMetric"]:hover {{
+    transform: translateY(-3px) !important; border-color: var(--accent) !important;
+}}
+[data-testid="stMetricValue"] {{
+    font-variant-numeric: tabular-nums !important; letter-spacing: -.02em !important;
+}}
+
+/* ✦ Dataframes — softer, rounded, bordered */
+[data-testid="stDataFrame"] {{
+    border: 1px solid var(--border) !important; border-radius: 12px !important;
+    overflow: hidden !important;
+}}
+
+/* ✦ Expanders — refined */
+[data-testid="stExpander"] {{
+    border: 1px solid var(--border) !important; border-radius: 12px !important;
+    background: var(--card) !important; overflow: hidden;
+}}
+
+/* ✦ Subtle slide-in on load — NO opacity fade, so a page switch never shows the
+   previous page through the new one (the old "foggy ghost" effect). */
+.block-container > div {{ animation: viewslide .22s ease both; }}
+@keyframes viewslide {{ from {{ transform: translateY(4px); }} to {{ transform: none; }} }}
+
+/* Respect reduced motion */
+@media (prefers-reduced-motion: reduce) {{
+    *, ::before, ::after {{ animation: none !important; transition: none !important; }}
+}}
+</style>
+"""
+
+# ── Price Fetcher & Logic ───────────────────────────────────────────────────────
+_CACHE = {}
+_TTL = 300
+
+
+def fetch_price(symbol):
+    clean = str(symbol).upper().strip()
+    for sfx in [".NS", ".BO", ".NSE", ".BSE"]:
+        if clean.endswith(sfx):
+            clean = clean[:-len(sfx)]
+    if clean in _CACHE and time.time() - _CACHE[clean][1] < _TTL:
+        return _CACHE[clean][0]
+
+    def _fast(t):
+        try:
+            fi = t.fast_info
+        except Exception:
+            return None
+        for key in ("last_price", "lastPrice", "regularMarketPrice"):
+            for getter in (lambda: fi.get(key) if hasattr(fi, "get") else None,
+                           lambda: getattr(fi, key, None),
+                           lambda: fi[key]):
+                try:
+                    v = getter()
+                    if v is not None and not pd.isna(v) and float(v) > 0:
+                        return float(v)
+                except Exception:
+                    pass
+        return None
+
+    for sfx in [""]:
+        try:
+            t = yf.Ticker(clean + sfx)
+            v = _fast(t)
+            if v is not None:
+                p = round(v, 2)
+                _CACHE[clean] = (p, time.time())
+                return p
+            # auto_adjust=False → ACTUAL close, not dividend/split back-adjusted
+            h = t.history(period="5d", interval="1d", auto_adjust=False)
+            if h is not None and not h.empty and "Close" in h.columns:
+                lv = h["Close"].dropna()
+                if not lv.empty:
+                    p = round(float(lv.iloc[-1]), 2)
+                    _CACHE[clean] = (p, time.time())
+                    return p
+        except Exception:
+            continue
+    return None
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_chart_data(symbol, period, interval):
+    """Fetch OHLCV for the chart at any interval (intraday or daily).
+    Yahoo intraday limits: 1m→7d max, 5m/15m→60d max, 1h→730d.
+    auto_adjust=False for accurate actual prices. Returns DataFrame or None."""
+    import yfinance as _yf
+    clean = str(symbol).upper().strip()
+    for sfx in [".NS", ".BO", ".NSE", ".BSE"]:
+        if clean.endswith(sfx):
+            clean = clean[:-len(sfx)]
+    for sfx in [""]:
+        for _attempt in range(2):
+            try:
+                t = _yf.Ticker(clean + sfx)
+                df = t.history(period=period, interval=interval, auto_adjust=False)
                 if df is not None and not df.empty and "Close" in df.columns:
-                    out = _normalize_ohlcv(df)
-                    if out is not None and len(out) >= 2:
-                        return out
+                    return df.dropna(subset=["Close"])
             except Exception:
                 pass
-            # Method 2: yf.download (different endpoint)
             try:
-                df = yf.download(sym, period=period, interval="1d",
-                                 auto_adjust=False, progress=False, threads=False)
+                df = _yf.download(clean + sfx, period=period, interval=interval,
+                                  auto_adjust=False, progress=False, threads=False)
                 if df is not None and not df.empty:
                     if isinstance(df.columns, pd.MultiIndex):
                         df.columns = df.columns.get_level_values(0)
                     if "Close" in df.columns:
-                        out = _normalize_ohlcv(df)
-                        if out is not None and len(out) >= 2:
-                            return out
+                        return df.dropna(subset=["Close"])
             except Exception:
                 pass
             time.sleep(0.3)
     return None
 
 
-# ==============================================================================
-# RELATIVE STRENGTH (RS) vs NIFTY  —  IBD / Minervini style leadership ranking
-# ==============================================================================
-# RS answers: "Is this stock a leader or a laggard versus the broad market?"
-# Two layers:
-#   1. RS Ratio  — a weighted blend of the stock's return vs Nifty's return over
-#                  multiple lookbacks (recent weighted heaviest). >1.0 = leading.
-#   2. RS Rating — that ratio converted to a 1-99 PERCENTILE across the scanned
-#                  universe (IBD-style: 80+ = strong leader, <30 = laggard).
-#
-# A high-RS stock in a VCP base near a pivot is the classic Minervini long.
-# ==============================================================================
-
-_NIFTY_BENCH_CACHE = {"ts": 0, "data": None}
-
-
-def _get_nifty_benchmark():
-    """Return Nifty's trailing returns over standard lookbacks (cached 15 min).
-    Returns dict {'21': r, '63': r, '126': r, '252': r} of % returns, or None."""
-    now = time.time()
-    if _NIFTY_BENCH_CACHE["data"] and (now - _NIFTY_BENCH_CACHE["ts"]) < _CACHE_TTL:
-        return _NIFTY_BENCH_CACHE["data"]
-    df = _fetch_index_history(BENCH_SYM, period="1y")
-    if df is None or df.empty or len(df) < 30:
-        return None
-    closes = df["Close"].dropna().values.astype(float)
-    bench = {}
-    for lb in (21, 63, 126, 252):
-        if len(closes) > lb:
-            past = closes[-lb - 1]
-            bench[str(lb)] = (closes[-1] / past - 1) * 100 if past > 0 else 0.0
-        else:
-            # Not enough history for this window — use the longest available
-            past = closes[0]
-            bench[str(lb)] = (closes[-1] / past - 1) * 100 if past > 0 else 0.0
-    _NIFTY_BENCH_CACHE["data"] = bench
-    _NIFTY_BENCH_CACHE["ts"] = now
-    return bench
-
-
-def compute_relative_strength(close, bench=None):
-    """Compute a stock's RS ratio versus Nifty.
-
-    Uses IBD-style weighting: the most recent quarter counts double.
-    RS ratio > 1.0 means the stock is OUTPERFORMING Nifty; < 1.0 underperforming.
-
-    Returns dict: {rs_ratio, rs_line, outperforming, periods:{...}} or None.
-    """
-    if bench is None:
-        bench = _get_nifty_benchmark()
-    if bench is None:
-        return None
-    if close is None or len(close) < 30:
-        return None
-
-    c = close.values.astype(float) if hasattr(close, "values") else np.asarray(close, float)
-    c = c[~np.isnan(c)]
-    if len(c) < 30:
-        return None
-
-    # Stock returns over the same lookbacks
-    periods = {}
-    weights = {"21": 0.4, "63": 0.2, "126": 0.2, "252": 0.2}   # recent weighted 2x
-    rs_components = []
-    total_w = 0.0
-    for lb_str, w in weights.items():
-        lb = int(lb_str)
-        if len(c) > lb:
-            past = c[-lb - 1]
-        else:
-            past = c[0]
-        stock_ret = (c[-1] / past - 1) * 100 if past > 0 else 0.0
-        nifty_ret = bench.get(lb_str, 0.0)
-        periods[lb_str] = {"stock": round(stock_ret, 1), "nifty": round(nifty_ret, 1)}
-        # RS component = (1+stock%) / (1+nifty%) — ratio of growth factors
-        sf = 1 + stock_ret / 100.0
-        nf = 1 + nifty_ret / 100.0
-        if nf > 0:
-            rs_components.append((sf / nf) * w)
-            total_w += w
-
-    if total_w == 0:
-        return None
-    rs_ratio = sum(rs_components) / total_w
-
-    return {
-        "rs_ratio": round(rs_ratio, 3),
-        "outperforming": rs_ratio > 1.0,
-        "periods": periods,
-    }
-
-
-def _rs_ratio_to_rating(ratio, all_ratios):
-    """Convert an RS ratio to a 1-99 percentile rating within the universe."""
-    if not all_ratios:
-        return None
-    below = sum(1 for r in all_ratios if r < ratio)
-    pct = below / len(all_ratios) * 100
-    return max(1, min(99, int(round(pct))))
-
-
-def get_market_regime():
-    now = time.time()
-    if _market_regime_cache["data"] and (now - _market_regime_cache["ts"]) < _CACHE_TTL:
-        return _market_regime_cache["data"]
-
-    indices_data = {}
-    bulk_data = {}
-
-    # Fetch each index individually with the resilient fetcher. Doing them one
-    # by one (not bulk) means one failing index never wipes out the rest.
-    for name, symbol in TRACKED_INDICES.items():
-        df = _fetch_index_history(symbol, period="1y")
-        if df is not None and len(df) >= 2:
-            bulk_data[symbol] = df
-            current = float(df["Close"].iloc[-1])
-            prev    = float(df["Close"].iloc[-2])
-            chg     = round((current / prev - 1) * 100, 2)
-            indices_data[name] = {"price": round(current, 2), "chg_pct": chg}
-        elif df is not None and len(df) == 1:
-            bulk_data[symbol] = df
-            current = float(df["Close"].iloc[-1])
-            indices_data[name] = {"price": round(current, 2), "chg_pct": 0.0}
-
-    nifty = indices_data.get(BENCH_NAME, {})
-    nifty_close = nifty.get("price")
-    regime, trend, nifty_rsi = "Unknown", "Sideways", None
-    support, resistance, conf = None, None, 50
-
-    if nifty_close and BENCH_SYM in bulk_data:
-        df = bulk_data[BENCH_SYM]
-        if len(df) >= 50:
-            close  = df["Close"]
-            ema20  = float(close.ewm(span=20,  adjust=False).mean().iloc[-1])
-            ema50  = float(close.ewm(span=50,  adjust=False).mean().iloc[-1])
-            ema200 = float(close.ewm(span=200, adjust=False).mean().iloc[-1]) if len(close) >= 200 else None
-            nifty_rsi  = compute_rsi(close)
-            support    = float(df["Low"].rolling(20).min().iloc[-1])
-            resistance = float(df["High"].rolling(20).max().iloc[-1])
-
-            if ema200 and nifty_close > ema200:
-                if nifty_close > ema20 > ema50: regime, trend = "Strong Bull", "Uptrend"
-                elif nifty_close > ema20: regime, trend = "Bull", "Uptrend"
-                else: regime, trend = "Bull Pullback", "Pullback"
-            elif ema200 and nifty_close < ema200:
-                if nifty_close < ema20 < ema50: regime, trend = "Strong Bear", "Downtrend"
-                elif nifty_close < ema20: regime, trend = "Bear", "Downtrend"
-                else: regime, trend = "Bear Rally", "Relief Rally"
-            else:
-                regime, trend = "Neutral", "Sideways"
-
-            if regime in ("Strong Bull", "Strong Bear"): conf = 85
-            elif regime in ("Bull", "Bear"): conf = 70
-            elif regime in ("Bull Pullback", "Bear Rally"): conf = 55
-
-    if nifty_rsi:
-        if nifty_rsi > 70: conf = min(95, conf + 15)
-        elif nifty_rsi < 40: conf = max(20, conf - 20)
-
-    risk = "Neutral"
-    if nifty_rsi:
-        if nifty_rsi > 70: risk = "High Momentum (Power Zone)"
-        elif nifty_rsi > 60: risk = "Building Momentum"
-        elif nifty_rsi < 40: risk = "High Risk (Downtrend/Bleeding)"
-
-    result = {
-        "regime": regime, "trend": trend, "nifty_close": nifty_close,
-        "nifty_rsi": nifty_rsi, "risk_level": risk, "indices": indices_data,
-        "support": support, "resistance": resistance, "confidence": conf,
-        "indices_ok": len(indices_data) > 0,
-    }
-    # Only cache a GOOD result (with at least some index data). If everything
-    # failed (transient Yahoo rate-limit), don't poison the 10-min cache with
-    # an empty result — let the next call retry instead.
-    if indices_data:
-        _market_regime_cache["data"] = result
-        _market_regime_cache["ts"] = now
-    return result
-
-
-# ==============================================================================
-# TECHNICAL INDICATORS — v12 with all fixes
-# ==============================================================================
-def _compute_indicators_raw(symbol, period="1y", prefetched_df=None):
-    df = prefetched_df
-    if df is None:
-        df = _fetch_history(_yahoo(symbol), period=period, interval="1d")
-
-    # Minimum bars: need ~20 for the rolling-20 indicators (BB, S/R, vol avg).
-    # Newly listed stocks with 20-49 bars get computed but flagged as limited.
-    # Below 20 bars there isn't enough to compute anything reliable.
-    if df is None or len(df) < 20:
-        return None
-    _limited_history = len(df) < 50   # newly listed → some long-period signals N/A
-
-    open_p = df["Open"]; high = df["High"]; low = df["Low"]
-    close = df["Close"]; vol = df["Volume"]
-    cmp = float(close.iloc[-1])
-    if pd.isna(cmp) or cmp <= 0:
-        return None
-
-    # ── FIX 1: RSI with adjust=False + edge case ──────────────────────────────
-    rsi_series = compute_rsi_wilder(close, 14)
-    rsi = round(float(rsi_series.iloc[-1]), 1) if not pd.isna(rsi_series.iloc[-1]) else None
-
-    # ── FIX 7: EMAs with adjust=False + slope detection + EMA200 restored ────
-    ema9_s   = close.ewm(span=9,   adjust=False).mean()
-    ema21_s  = close.ewm(span=21,  adjust=False).mean()
-    ema50_s  = close.ewm(span=50,  adjust=False).mean()
-    ema200_s = close.ewm(span=200, adjust=False).mean() if len(close) >= 100 else None
-
-    ema9   = float(ema9_s.iloc[-1])
-    ema21  = float(ema21_s.iloc[-1])
-    ema50  = float(ema50_s.iloc[-1])
-    ema200 = float(ema200_s.iloc[-1]) if ema200_s is not None else None
-
-    # Slope over last 3 bars — momentum direction of the EMA itself
-    ema9_slope  = float(ema9_s.iloc[-1] - ema9_s.iloc[-4])  if len(ema9_s)  >= 4 else 0.0
-    ema21_slope = float(ema21_s.iloc[-1] - ema21_s.iloc[-4]) if len(ema21_s) >= 4 else 0.0
-    ema_rising      = ema9_slope > 0 and ema21_slope > 0
-    ema_flattening  = abs(ema9_slope) < (cmp * 0.001)   # <0.1% of price over 3 bars
-
-    # ── FIX 2: MACD — adjust=False, single-pass crossover, histogram ─────────
-    macd_fast   = close.ewm(span=12, adjust=False).mean()
-    macd_slow   = close.ewm(span=26, adjust=False).mean()
-    macd_line   = macd_fast - macd_slow
-    signal_line = macd_line.ewm(span=9, adjust=False).mean()
-    histogram   = macd_line - signal_line
-
-    macd_bullish = macd_bearish = False
-    if len(macd_line) >= 3:
-        prev_diff = float(macd_line.iloc[-2]) - float(signal_line.iloc[-2])
-        curr_diff = float(macd_line.iloc[-1]) - float(signal_line.iloc[-1])
-        if prev_diff <= 0 and curr_diff > 0:
-            macd_bullish = True            # fresh bullish cross — mutually exclusive
-        elif prev_diff >= 0 and curr_diff < 0:
-            macd_bearish = True            # fresh bearish cross
-
-    hist_val   = round(float(histogram.iloc[-1]), 4)
-    hist_slope = float(histogram.iloc[-1] - histogram.iloc[-2]) if len(histogram) >= 2 else 0.0
-    macd_hist_expanding   = hist_val > 0 and hist_slope > 0   # bull momentum building
-    macd_hist_contracting = hist_val > 0 and hist_slope < 0   # bull momentum fading
-
-    rsi_div  = detect_rsi_divergence(close, rsi_series)
-    macd_div = detect_macd_divergence(close, macd_line)
-
-    # ── FIX 3: Bollinger — clamped bb_pos + bandwidth + squeeze ──────────────
-    bb_sma = float(close.rolling(20).mean().iloc[-1])
-    bb_std = float(close.rolling(20).std().iloc[-1])
-    if pd.isna(bb_sma): bb_sma = float(close.mean())
-    if pd.isna(bb_std): bb_std = float(close.std()) if len(close) > 1 else 0.0
-    bb_upper, bb_lower = bb_sma + 2 * bb_std, bb_sma - 2 * bb_std
-    bb_range = bb_upper - bb_lower
-    bb_pos = round(max(0.0, min(1.0, (cmp - bb_lower) / bb_range)), 2) if bb_range > 0 else 0.5
-    # Breakout flags — replace info lost by clamping
-    bb_breakout_up   = cmp > bb_upper
-    bb_breakout_down = cmp < bb_lower
-
-    bb_bandwidth = round(bb_range / bb_sma, 4) if bb_sma > 0 else None
-    bb_squeeze   = False
-    if bb_bandwidth is not None and len(close) >= 40:
-        bw_series  = (close.rolling(20).std() * 4) / close.rolling(20).mean()
-        bw_avg     = float(bw_series.rolling(20).mean().iloc[-1])
-        if not pd.isna(bw_avg) and bw_avg > 0:
-            bb_squeeze = bb_bandwidth < bw_avg * 0.75   # 25% below recent avg
-
-    # ── FIX 4: Wilder ATR ──────────────────────────────────────────────────────
-    tr, atr_series = compute_atr_wilder(high, low, close, 14)
-    atr = float(atr_series.iloc[-1]) if not pd.isna(atr_series.iloc[-1]) \
-        else float(high.iloc[-1] - low.iloc[-1])
-
-    # ── Volume & Liquidity (FIX 10: soft gate, not silent None) ──────────────
-    vol_avg   = float(vol.rolling(20).mean().iloc[-1]) if len(vol) >= 20 else float(vol.mean())
-    vol_ratio = float(vol.iloc[-1]) / vol_avg if vol_avg > 0 else 1.0
-    avg_turnover = vol_avg * cmp
-    liquidity_ok = avg_turnover >= 10_000_000   # $10M daily turnover
-
-    # ── 20-day S/R ─────────────────────────────────────────────────────────────
-    _sr_window = min(20, len(close))
-    support    = float(low.rolling(_sr_window).min().iloc[-1])
-    resistance = float(high.rolling(_sr_window).max().iloc[-1])
-    if pd.isna(support):    support = float(low.min())
-    if pd.isna(resistance): resistance = float(high.max())
-    high52, low52 = float(high.max()), float(low.min())
-
-    # ── Trend with slope guard ────────────────────────────────────────────────
-    trend = "Sideways"
-    if cmp > ema9 > ema21:
-        trend = "Strong Uptrend"
-        if ema_flattening:
-            trend = "Uptrend (Momentum Fading)"
-    elif cmp > ema21:
-        trend = "Uptrend" if ema_rising else "Recovery"
-    elif cmp < ema9 < ema21:
-        trend = "Strong Downtrend"
-    elif cmp < ema21:
-        trend = "Downtrend"
-
-    # ── FIX 8: Fibonacci — swing-peak based via scipy ─────────────────────────
-    c_vals = close.values
-    swing_peaks,   _ = find_peaks( c_vals, distance=8, prominence=c_vals.std() * 0.3)
-    swing_troughs, _ = find_peaks(-c_vals, distance=8, prominence=c_vals.std() * 0.3)
-
-    fib_h = float(c_vals[swing_peaks[-1]])   if len(swing_peaks)   >= 1 else float(high.tail(60).max())
-    fib_l = float(c_vals[swing_troughs[-1]]) if len(swing_troughs) >= 1 else float(low.tail(60).min())
-    if fib_h < fib_l:                        # latest trough is above latest peak → swap
-        fib_h, fib_l = fib_l, fib_h
-    if (fib_h - fib_l) / (fib_l + 1e-8) < 0.02:   # degenerate swing → widen to 60-bar
-        fib_h, fib_l = float(high.tail(60).max()), float(low.tail(60).min())
-
-    fib_d   = fib_h - fib_l
-    fib_236 = round(fib_h - fib_d * 0.236, 2)
-    fib_382 = round(fib_h - fib_d * 0.382, 2)
-    fib_500 = round(fib_h - fib_d * 0.500, 2)
-    fib_618 = round(fib_h - fib_d * 0.618, 2)
-
-    chart_patterns = detect_price_patterns(high, low, close, vol, vol_avg)
-    candlesticks   = detect_candlesticks(open_p, high, low, close)
-
-    # ── FIX 5: Supertrend — numpy loop, Wilder ATR(10), multiplier 2.5 ───────
-    supertrend, supertrend_bullish = None, None
-    try:
-        st_period = 10
-        st_mult   = 2.5     # 2.5 for NSE 5-15 day swing; 3.0 = positional
-        _, atr_st_series = compute_atr_wilder(high, low, close, st_period)
-        atr_st = atr_st_series.values
-        hl2    = ((high + low) / 2).values
-        c_arr  = close.values
-        n      = len(c_arr)
-
-        st_arr  = np.full(n, np.nan)
-        dir_arr = np.ones(n, dtype=int)
-
-        for i in range(n):
-            if i < st_period or np.isnan(atr_st[i]):
-                st_arr[i]  = c_arr[i]
-                dir_arr[i] = 1
-                continue
-            upper = hl2[i] + st_mult * atr_st[i]
-            lower = hl2[i] - st_mult * atr_st[i]
-            if dir_arr[i - 1] == 1:                     # was bullish
-                if c_arr[i] < st_arr[i - 1]:            # crossed below → flip
-                    dir_arr[i] = -1
-                    st_arr[i]  = upper
-                else:
-                    dir_arr[i] = 1
-                    st_arr[i]  = max(lower, st_arr[i - 1])   # trail up only
-            else:                                       # was bearish
-                if c_arr[i] > st_arr[i - 1]:            # crossed above → flip
-                    dir_arr[i] = 1
-                    st_arr[i]  = lower
-                else:
-                    dir_arr[i] = -1
-                    st_arr[i]  = min(upper, st_arr[i - 1])   # trail down only
-
-        supertrend         = round(float(st_arr[-1]), 2)
-        supertrend_bullish = bool(dir_arr[-1] == 1)
-    except Exception:
-        pass
-
-    # ── FIX 6: VWAP — 20-day rolling, anchored to typical price ──────────────
-    vwap, price_vs_vwap = None, None
-    try:
-        typical = (high + low + close) / 3
-        roll_n  = min(20, len(close))
-        cum_tpv = (typical * vol).rolling(roll_n).sum()
-        cum_v   = vol.rolling(roll_n).sum().replace(0, np.nan)
-        vwap_s  = cum_tpv / cum_v
-        v = float(vwap_s.iloc[-1])
-        if not pd.isna(v) and v > 0:
-            vwap = round(v, 2)
-            price_vs_vwap = round((cmp - vwap) / vwap * 100, 2)
-    except Exception:
-        pass
-
-    # ── Bull / Bear Trap detection (v4 — ATR-normalised, RSI-at-peak) ────────
-    # Pull cached market regime so the regime-context factor activates live.
-    try:
-        _mkt_regime = get_market_regime()
-    except Exception:
-        _mkt_regime = None
-    traps = detect_trap_signals(
-        close, high, low, vol, vol_avg, rsi_series,
-        supertrend_bullish, resistance, support,
-        candlesticks, atr, high52, low52, window=15,
-        market_regime=_mkt_regime
-    )
-
-    # ── Smart Money Concepts (FVG, OB, Liquidity, Premium/Discount, Displacement) ─
-    try:
-        smc = compute_smc(open_p, high, low, close, vol, atr)
-    except Exception:
-        smc = {}
-
-    # ── VCP — Volatility Contraction Pattern (Minervini) ─────────────────────
-    try:
-        vcp = detect_vcp(close, high, low, vol, atr, lookback=80)
-    except Exception:
-        vcp = {"is_vcp": False, "vcp_ready": False, "contractions": [],
-               "pivot": None, "quality": None, "detail": ""}
-
-    # ── Relative Strength vs Nifty ───────────────────────────────────────────
-    try:
-        rs = compute_relative_strength(close)
-    except Exception:
-        rs = None
-
-    return {
-        "symbol": symbol, "cmp": round(cmp, 2), "rsi": rsi,
-        "limited_history": _limited_history, "bars": len(df),
-
-        # EMAs — v12 adds slope flags + ema200
-        "ema9": round(ema9, 2), "ema21": round(ema21, 2), "ema50": round(ema50, 2),
-        "ema200": round(ema200, 2) if ema200 else None,
-        "ema_rising": ema_rising, "ema_flattening": ema_flattening,
-        # Legacy aliases for app.py
-        "ema20": round(ema9, 2), "ema50_alias": round(ema21, 2),
-
-        # MACD — v12 adds histogram intelligence
-        "macd_bullish": macd_bullish, "macd_bearish": macd_bearish,
-        "macd_histogram": hist_val,
-        "macd_hist_expanding": macd_hist_expanding,
-        "macd_hist_contracting": macd_hist_contracting,
-
-        "rsi_divergence": rsi_div, "macd_divergence": macd_div,
-
-        # BB — v12 adds bandwidth/squeeze/breakout flags
-        "bb_upper": round(bb_upper, 2), "bb_lower": round(bb_lower, 2),
-        "bb_sma": round(bb_sma, 2), "bb_pos": bb_pos,
-        "bb_bandwidth": bb_bandwidth, "bb_squeeze": bb_squeeze,
-        "bb_breakout_up": bb_breakout_up, "bb_breakout_down": bb_breakout_down,
-
-        "atr": round(atr, 2), "vol_ratio": round(vol_ratio, 2),
-        "support": round(support, 2), "resistance": round(resistance, 2),
-        "high52": round(high52, 2), "low52": round(low52, 2),
-        "trend": trend,
-        "fib_236": fib_236, "fib_382": fib_382, "fib_500": fib_500, "fib_618": fib_618,
-        "supertrend": supertrend, "supertrend_bullish": supertrend_bullish,
-        "vwap": vwap, "price_vs_vwap": price_vs_vwap,
-        "patterns": chart_patterns, "candlesticks": candlesticks,
-        "avg_turnover": avg_turnover, "atr_pct": (atr / cmp) if cmp > 0 else 0,
-        "liquidity_ok": liquidity_ok,   # FIX 10: visible flag, not silent None
-        # Trap signals
-        "bull_trap": traps["bull_trap"],
-        "bear_trap": traps["bear_trap"],
-        "bull_trap_conf": traps["bull_trap_conf"],
-        "bear_trap_conf": traps["bear_trap_conf"],
-        "bull_trap_detail": traps["bull_trap_detail"],
-        "bear_trap_detail": traps["bear_trap_detail"],
-        # VCP — Volatility Contraction Pattern
-        "vcp": vcp.get("is_vcp", False),
-        "vcp_ready": vcp.get("vcp_ready", False),
-        "vcp_quality": vcp.get("quality"),
-        "vcp_pivot": vcp.get("pivot"),
-        "vcp_pivot_dist": vcp.get("pivot_distance_pct"),
-        "vcp_contractions": vcp.get("contractions", []),
-        "vcp_detail": vcp.get("detail", ""),
-        # Relative Strength vs Nifty
-        "rs_ratio": rs.get("rs_ratio") if rs else None,
-        "rs_outperforming": rs.get("outperforming") if rs else None,
-        "rs_periods": rs.get("periods") if rs else None,
-        # Smart Money Concepts — merged via **smc
-        **smc,
-    }
-
-
-def compute_indicators(symbol, period="1y", prefetched_df=None):
-    now = time.time()
-    key = f"{symbol}_{period}"
-    if key in _IND_CACHE and (now - _IND_CACHE_TS.get(key, 0)) < _CACHE_TTL:
-        return _IND_CACHE[key]
-    result = _compute_indicators_raw(symbol, period, prefetched_df)
-    if result is not None:
-        _IND_CACHE[key] = result
-        _IND_CACHE_TS[key] = now
-    return result
-
-
-# ==============================================================================
-# FIX 9: UNIFIED RISK ENGINE — single source of truth, now used EVERYWHERE
-# ==============================================================================
-def _calc_risk_params(cmp, atr, resistance, buy_at=None, pct=None,
-                      supertrend_val=None, supertrend_bullish=None,
-                      action="HOLD"):
-    """
-    HOLD/AVERAGE/WATCH (existing positions):
-      Target = max(20d resistance, cmp + 2.5*ATR)
-      SL     = cmp - 2.0*ATR, raised to supertrend if bullish & higher
-    PICK (fresh entries — sector picks AND universe scanner):
-      Target = max(cmp*1.10, cmp + 2.5*ATR)
-      SL     = cmp - 1.25*ATR
-    SELL:
-      Target = cmp (exit now), SL = re-entry zone
-    """
-    if action == "PICK":
-        stop_loss = round(cmp - 1.25 * atr, 2)
-        target    = round(max(cmp * 1.10, cmp + 2.5 * atr), 2)
-    elif action in ("HOLD", "AVERAGE", "WATCH"):
-        stop_loss = round(cmp - 2.0 * atr, 2)
-        if supertrend_bullish and supertrend_val and supertrend_val > stop_loss:
-            stop_loss = round(supertrend_val, 2)
-        target = round(max(resistance, cmp + 2.5 * atr), 2)
-    else:   # SELL
-        stop_loss = round(cmp - 2.0 * atr, 2)
-        target    = round(cmp, 2)
-
-    risk   = cmp - stop_loss
-    reward = target - cmp
-    rr = round(reward / risk, 2) if risk > 0.01 else None
-    return target, stop_loss, rr
-
-
-# ─── Expert Signal Engine ─────────────────────────────────────────────────────
-def generate_signals(trades_df):
-    signals = []
-    open_trades = trades_df[trades_df["status"] == "Open"].copy()
-    if open_trades.empty:
-        return signals
-
-    market = get_market_regime()
-    is_bear = market["regime"] in ("Strong Bear", "Bear")
-
-    unique_symbols = open_trades["stock"].unique().tolist()
-    bulk_data = _bulk_fetch_history(unique_symbols, period="1y")
-
-    for _, row in open_trades.iterrows():
-        symbol, buy_at, qty, tid = row["stock"], row["buy_at"], row["quantity"], row["id"]
-
-        df  = bulk_data.get(symbol)
-        ind = compute_indicators(symbol, period="1y", prefetched_df=df)
-
-        if ind is None:
-            signals.append({
-                "id": tid, "stock": symbol, "sector": get_sector(symbol),
-                "action": "⚪ WATCH",
-                "reason": "No usable data — either the NSE symbol is wrong, or it's "
-                          "newly listed with under 20 trading days of history",
-                "strength": 0, "cmp": None, "rsi": None, "pct_from_buy": None,
-                "target": None, "stop_loss": None, "avg_price": None,
-                "new_avg": None, "new_sl": None, "macd_signal": "—",
-                "bb_position": "—", "trend": "—", "support": None,
-                "resistance": None, "risk_reward": None, "buy_at": buy_at,
-                "quantity": qty, "market_regime": market["regime"],
-                "divergence": "—", "supertrend": "—", "vwap": None, "fib_levels": {},
-            })
-            continue
-
-        cmp, rsi = ind["cmp"], ind["rsi"]
-        ema9, ema21, ema50 = ind["ema9"], ind["ema21"], ind["ema50"]
-        support, resistance = ind["support"], ind["resistance"]
-        atr   = ind["atr"]
-        trend = ind["trend"]
-        macd_bull, macd_bear = ind["macd_bullish"], ind["macd_bearish"]
-        hist_fading          = ind.get("macd_hist_contracting", False)
-        bb_pos               = ind["bb_pos"]
-        bb_breakout_up       = ind.get("bb_breakout_up", False)
-        rsi_div, macd_div    = ind["rsi_divergence"], ind["macd_divergence"]
-        st_bullish, st_val   = ind.get("supertrend_bullish"), ind.get("supertrend")
-        vwap        = ind.get("vwap")
-        pv_vwap     = ind.get("price_vs_vwap")
-        patterns    = ind.get("patterns", [])
-        candles     = ind.get("candlesticks", [])
-        bb_squeeze  = ind.get("bb_squeeze", False)
-        ema_fading  = ind.get("ema_flattening", False)
-        bull_trap   = ind.get("bull_trap", False)
-        bear_trap   = ind.get("bear_trap", False)
-        bt_conf     = ind.get("bull_trap_conf", 0)
-        bt_detail   = ind.get("bull_trap_detail", "")
-        brt_conf    = ind.get("bear_trap_conf", 0)
-        brt_detail  = ind.get("bear_trap_detail", "")
-
-        pct      = round((cmp - buy_at) / buy_at * 100, 2)
-        near52h  = cmp >= ind["high52"] * 0.97
-        nifty_chg = market.get("indices", {}).get("Nifty 50", {}).get("chg_pct", 0)
-        stock_rs_strong = pct > nifty_chg
-
-        # ── SELL Triggers ─────────────────────────────────────────────────────
-        sell = []
-        if rsi and rsi >= 75: sell.append(f"RSI overbought ({rsi})")
-        if rsi and rsi >= 70 and near52h: sell.append("Near 52w high")
-        atr_trail = round(cmp - 2.0 * atr, 2)
-        effective_trail = round(max(atr_trail, st_val), 2) if (st_bullish and st_val) else atr_trail
-        if cmp < effective_trail: sell.append(f"Below Trail Stop (${effective_trail})")
-        elif not st_bullish: sell.append("Supertrend Bearish")
-        if ema50 and cmp < ema50 and pct < -5: sell.append("Below EMA50 (-5% loss)")
-        if macd_bear: sell.append("MACD Bearish Cross")
-        if rsi_div["bearish_div"]: sell.append("RSI Bear Div")
-        if macd_div["bearish_div"]: sell.append("MACD Bear Div")
-        if "📈 Double Top" in patterns: sell.append("Double Top Rejection")
-        if "🏔️ Head & Shoulders (Top)" in patterns: sell.append("H&S Bearish Reversal")
-        if "🟥 Bearish Engulfing" in candles and rsi and rsi > 65: sell.append("Bearish Distribution Candle")
-        if ind["vol_ratio"] > 2.5 and rsi and rsi > 65: sell.append("Volume spike at resistance")
-        if trend in ("Downtrend", "Strong Downtrend") and pct < -8: sell.append(f"{trend} breakdown")
-        if is_bear and pct < -5: sell.append("Bear Market override")
-        # v12: momentum-fading early warning (histogram contracting + EMA flat + in profit)
-        if hist_fading and ema_fading and pct > 8 and rsi and rsi > 60:
-            sell.append("Momentum fading — book partial profits")
-        # Trap signals
-        if bull_trap:
-            sell.append(f"🪤 Bull Trap (conf {bt_conf}%) — {bt_detail}")
-
-        # ── AVERAGE / BUY Triggers ─────────────────────────────────────────────
-        avg = []
-        can_avg = not (trend == "Strong Downtrend" and
-                       not ("📉 Double Bottom" in patterns or "🛤️ Inverse H&S (Bottom)" in patterns))
-        if can_avg:
-            if rsi and rsi <= 40 and pct < -5:
-                if "🔨 Bullish Hammer" in candles or "🟩 Bullish Engulfing" in candles:
-                    avg.append(f"Oversold Bounce Confirmed by {candles[0]}")
-            if "📉 Double Bottom" in patterns and stock_rs_strong: avg.append("Double Bottom + Relative Strength")
-            if "🛤️ Inverse H&S (Bottom)" in patterns: avg.append("Inverse H&S Reversal")
-            if trend in ("Uptrend", "Strong Uptrend") and cmp <= ema9 * 1.015 and pct < -3:
-                if "🔨 Bullish Hammer" in candles: avg.append("EMA9 Pullback + Hammer Confirmation")
-            if "🚀 Vol Breakout" in patterns and pct < 0: avg.append("Reversal Vol Breakout")
-            if "🚩 Bull Flag Breakout" in patterns and pct < 0: avg.append("Bull Flag Breakout")
-            # v12: squeeze release entry
-            if bb_squeeze and bb_breakout_up and pct < 0:
-                avg.append("BB Squeeze Release ↑")
-            # Bear trap = trapped sellers → reversal opportunity
-            if bear_trap:
-                avg.append(f"🪤 Bear Trap (conf {brt_conf}%) — {brt_detail}")
-
-        # ── HOLD Triggers ──────────────────────────────────────────────────────
-        hold = []
-        if "🚀 Vol Breakout" in patterns and pct > 0: hold.append("Bullish Breakout (Hold tight)")
-        if "🚩 Bull Flag Breakout" in patterns and pct > 0: hold.append("Bull Flag Continuation")
-        if rsi and 45 <= rsi <= 65 and cmp > ema9 and stock_rs_strong:
-            hold.append("RSI neutral, Above EMA9, Beating Index")
-        elif pct > 0 and not sell: hold.append(f"In profit {pct:+.1f}%")
-        elif st_bullish and trend in ("Uptrend", "Strong Uptrend") and not sell:
-            hold.append("Trend & Supertrend Bullish")
-
-        # ── Action determination — unified risk engine ─────────────────────────
-        if sell:
-            action      = "🔴 SELL"
-            reason_base = " | ".join(sell)
-            strength    = min(len(sell) * 25 + 15, 95)
-            target, stop_loss, rr = _calc_risk_params(
-                cmp, atr, resistance, action="SELL")
-            avg_price = new_avg = new_sl = None
-        elif avg:
-            action      = "🟡 AVERAGE"
-            reason_base = " | ".join(avg)
-            strength    = min(len(avg) * 22 + 18, 88)
-            avg_price   = cmp
-            new_avg     = round((buy_at * qty + cmp * qty) / (qty + qty), 2)
-            target, stop_loss, rr = _calc_risk_params(
-                cmp, atr, resistance,
-                supertrend_val=st_val, supertrend_bullish=st_bullish, action="AVERAGE")
-            new_sl = stop_loss
-        elif hold:
-            action      = "🟢 HOLD"
-            reason_base = hold[0]
-            strength    = 55
-            target, stop_loss, rr = _calc_risk_params(
-                cmp, atr, resistance,
-                supertrend_val=st_val, supertrend_bullish=st_bullish, action="HOLD")
-            avg_price = new_avg = new_sl = None
-        else:
-            action      = "⚪ WATCH"
-            reason_base = f"CMP ${cmp} | RSI {rsi if rsi else '—'} | {pct:+.1f}%"
-            strength    = 30
-            target, stop_loss, rr = _calc_risk_params(
-                cmp, atr, resistance,
-                supertrend_val=st_val, supertrend_bullish=st_bullish, action="WATCH")
-            avg_price = new_avg = new_sl = None
-
-        div_parts = []
-        if rsi_div["bullish_div"]: div_parts.append("RSI Bull")
-        if rsi_div["bearish_div"]: div_parts.append("RSI Bear")
-        if macd_div["bullish_div"]: div_parts.append("MACD Bull")
-        if macd_div["bearish_div"]: div_parts.append("MACD Bear")
-        div_lbl = ", ".join(div_parts) if div_parts else "None"
-
-        macd_lbl = "Bullish ↗" if macd_bull else ("Bearish ↘" if macd_bear else "Neutral →")
-        bb_lbl   = "Lower" if bb_pos < 0.2 else ("Upper" if bb_pos > 0.8 else "Mid")
-        st_lbl   = f"Bullish ${st_val}" if st_bullish else (f"Bearish ${st_val}" if st_val else "—")
-
-        all_pats     = patterns + candles
-        pat_str      = " | ".join(all_pats) if all_pats else ""
-        final_reason = f"[{pat_str}] {reason_base}" if pat_str else reason_base
-        if not ind.get("liquidity_ok", True):
-            final_reason += " ⚠️ Low liquidity (<$1Cr/day)"
-
-        signals.append({
-            "id": tid, "stock": symbol, "sector": get_sector(symbol),
-            "action": action, "reason": final_reason, "strength": strength,
-            "cmp": cmp, "rsi": rsi,
-            "ema20": ema9, "ema50": ema21,   # legacy display labels
-            "atr": atr,
-            "pct_from_buy": pct, "buy_at": buy_at, "quantity": qty,
-            "target": target, "stop_loss": stop_loss,
-            "avg_price": avg_price, "new_avg": new_avg, "new_sl": new_sl,
-            "macd_signal": macd_lbl, "bb_position": bb_lbl,
-            "trend": trend, "support": support, "resistance": resistance,
-            "risk_reward": rr, "vol_ratio": ind["vol_ratio"],
-            "market_regime": market["regime"], "divergence": div_lbl,
-            "supertrend": st_lbl, "vwap": vwap,
-            "fib_levels": {
-                "23.6%": ind.get("fib_236"), "38.2%": ind.get("fib_382"),
-                "50%": ind.get("fib_500"), "61.8%": ind.get("fib_618")
-            },
-            "limited_history": ind.get("limited_history", False),
-            "bars": ind.get("bars"),
-            "vcp": ind.get("vcp", False),
-            "vcp_ready": ind.get("vcp_ready", False),
-            "vcp_quality": ind.get("vcp_quality"),
-            "rs_ratio": ind.get("rs_ratio"),
-            "rs_outperforming": ind.get("rs_outperforming"),
-        })
-    return signals
-
-
-# ─── Sector Rotation (unchanged from v11 — already 8/10) ──────────────────────
-def sector_rotation(trades_df=None):
-    rows = []
-    idx_symbols = list(SECTOR_INDICES.values()) + ["^NSEI"]
-    bulk_data   = _bulk_fetch_history(idx_symbols, period="6mo")
-
-    nifty_df    = bulk_data.get("^NSEI")
-    nifty_ret1m = nifty_ret3m = 0.0
-    if nifty_df is not None and len(nifty_df) >= 21:
-        nifty_ret1m = (float(nifty_df["Close"].iloc[-1]) / float(nifty_df["Close"].iloc[-21]) - 1) * 100
-    if nifty_df is not None and len(nifty_df) >= 61:
-        nifty_ret3m = (float(nifty_df["Close"].iloc[-1]) / float(nifty_df["Close"].iloc[-61]) - 1) * 100
-
-    for sector, idx_sym in SECTOR_INDICES.items():
-        try:
-            df_idx = bulk_data.get(idx_sym)
-            if df_idx is None or len(df_idx) < 21:
-                continue
-            close   = df_idx["Close"]
-            cmp_now = float(close.iloc[-1])
-            rsi     = compute_rsi(close)
-            ema20   = float(close.ewm(span=20, adjust=False).mean().iloc[-1])
-            ema50   = float(close.ewm(span=50, adjust=False).mean().iloc[-1]) if len(close) >= 50 else ema20
-            ret_1w  = (cmp_now / float(close.iloc[-6])  - 1) * 100 if len(close) >= 6  else 0.0
-            ret_1m  = (cmp_now / float(close.iloc[-21]) - 1) * 100 if len(close) >= 21 else 0.0
-            ret_3m  = (cmp_now / float(close.iloc[-61]) - 1) * 100 if len(close) >= 61 else 0.0
-            rs_1m   = round(ret_1m - nifty_ret1m, 2)
-            rs_3m   = round(ret_3m - nifty_ret3m, 2)
-            rs_ratio    = 100 + rs_3m / 10
-            rs_momentum = 100 + rs_1m / 5
-            if   rs_ratio > 100 and rs_momentum > 100: rrg_quadrant = "🔥 Leading"
-            elif rs_ratio > 100: rrg_quadrant = "📉 Weakening"
-            elif rs_momentum > 100: rrg_quadrant = "🔄 Improving"
-            else: rrg_quadrant = "❄️ Lagging"
-            above_ema50 = (close > close.ewm(span=50, adjust=False).mean()).astype(int)
-            streak = 0
-            for val in reversed(above_ema50.values):
-                if val == 1: streak += 1
-                else: break
-            rsi_score   = (rsi / 100) if rsi else 0.5
-            rs_score    = max(-1.0, min(1.0, rs_1m / 10))
-            trend_score = min(1.0, streak / 60)
-            macd_score  = 1.0 if cmp_now > ema20 > ema50 else (0.5 if cmp_now > ema20 else 0.0)
-            momentum_score = round(rsi_score * 0.20 + rs_score * 0.40 +
-                                   trend_score * 0.20 + macd_score * 0.20, 3)
-            rows.append({
-                "sector": sector,
-                "stocks": ", ".join(SECTOR_STOCKS.get(sector, [])[:4]) + "...",
-                "cmp": round(cmp_now, 2), "rsi": rsi,
-                "ret_1w": round(ret_1w, 2), "ret_1m": round(ret_1m, 2), "ret_3m": round(ret_3m, 2),
-                "rs_vs_nifty_1m": rs_1m, "rs_vs_nifty_3m": rs_3m,
-                "rrg_quadrant": rrg_quadrant, "trend_days": streak,
-                "momentum_score": momentum_score, "macd_bullish": cmp_now > ema20,
-                "count": len(SECTOR_STOCKS.get(sector, [])),
-            })
-        except Exception:
-            continue
-
-    df = pd.DataFrame(rows)
+# Valid (period, interval) combinations for Yahoo intraday data
+_CHART_TIMEFRAMES = {
+    "5 min":  ("5d",  "5m"),
+    "15 min": ("1mo", "15m"),
+    "1 hour": ("3mo", "1h"),
+    "Daily":  ("6mo", "1d"),
+    "Weekly": ("2y",  "1wk"),
+}
+
+
+def enrich(df):
     if df.empty:
         return df
-    df = df.sort_values("momentum_score", ascending=False)
-    df["rank"] = range(1, len(df) + 1)
-    df["avg_rsi"] = df["rsi"]; df["avg_pct"] = df["ret_1m"]
-    df["bullish_count"] = df["macd_bullish"].astype(int)
-    df["index_chg"] = df["ret_1m"]
-    return df[["rank", "sector", "stocks", "count", "avg_rsi", "avg_pct",
-               "rs_vs_nifty_1m", "rs_vs_nifty_3m", "rrg_quadrant", "trend_days",
-               "momentum_score", "bullish_count", "index_chg"]]
+    # Use cached price fetcher — avoids re-fetching on every Streamlit rerun
+    symbols = tuple(sorted(df["stock"].unique().tolist()))
+    prices  = _cached_prices(symbols)
+    df = df.copy()
+    df["cmp"] = df["stock"].map(prices)
+    df["nse_label"] = df["stock"]
+    df["invested"] = df["quantity"] * df["buy_at"]
+    df["current_amt"] = __import__("numpy").where(
+        df["status"] == "Open",
+        df["quantity"] * df["cmp"].fillna(df["buy_at"]),
+        df["quantity"] * df["sell_at"].fillna(df["buy_at"])
+    )
+    df["total_amt"] = __import__("numpy").where(
+        df["sell_at"].notna(),
+        df["quantity"] * df["sell_at"],
+        df["current_amt"]
+    )
+    df["profit"] = df["total_amt"] - df["invested"]
+    df["profit_pct"] = (df["profit"] / df["invested"] * 100).round(2)
+    return df
 
 
-# ─── Sector Outlook ───────────────────────────────────────────────────────────
-def predict_sector_outlook(sector_df):
-    if sector_df.empty:
-        return pd.DataFrame()
-    preds = []
-    for _, r in sector_df.iterrows():
-        score = (r["momentum_score"] * 0.4
-                 + (r.get("index_chg", 0) / 10 if r.get("index_chg") else 0) * 0.3
-                 + (r["bullish_count"] / max(r["count"], 1)) * 0.3)
-        if score > 0.5: outlook, conf = "🔥 Strong Bullish", 85
-        elif score > 0.3: outlook, conf = "📈 Bullish", 70
-        elif score > 0.1: outlook, conf = "➡️ Neutral-Bullish", 55
-        elif score > -0.1: outlook, conf = "➡️ Neutral", 50
-        elif score > -0.3: outlook, conf = "📉 Weak", 30
-        else: outlook, conf = "🔻 Bearish", 20
-        if r["avg_rsi"] and r["avg_rsi"] > 65:
-            outlook = "🚀 Power Zone"; conf = min(conf + 15, 95)
-        elif r["avg_rsi"] and r["avg_rsi"] < 45:
-            outlook = "🩸 Bleeding — Avoid"; conf = max(conf - 20, 20)
-        preds.append({"sector": r["sector"], "outlook": outlook, "confidence": conf,
-                      "momentum": r["momentum_score"], "avg_rsi": r["avg_rsi"],
-                      "avg_pct": r["avg_pct"], "index_chg": r.get("index_chg")})
-    return pd.DataFrame(preds).sort_values("confidence", ascending=False)
+def calc_analytics(df):
+    if df.empty:
+        return {}
+    closed = df[df["status"] == "Closed"]
+    open_t = df[df["status"] == "Open"]
+    total_closed = len(closed)
+    wins   = len(closed[closed["profit"] > 0]) if not closed.empty else 0
+    losses = len(closed[closed["profit"] < 0]) if not closed.empty else 0
+    win_rate  = (wins / total_closed * 100) if total_closed > 0 else 0
+    avg_win   = closed[closed["profit"] > 0]["profit"].mean() if wins > 0 else 0
+    avg_loss  = abs(closed[closed["profit"] < 0]["profit"].mean()) if losses > 0 else 0
+    exp = ((wins / total_closed if total_closed > 0 else 0) * avg_win) - \
+          ((losses / total_closed if total_closed > 0 else 0) * avg_loss)
+    gp = closed[closed["profit"] > 0]["profit"].sum() if wins > 0 else 0
+    gl = abs(closed[closed["profit"] < 0]["profit"].sum()) if losses > 0 else 1
+    max_dd = abs(
+        (closed["profit"].cumsum() - closed["profit"].cumsum().expanding().max()).min()
+    ) if not closed.empty else 0
+    avg_hold = round(
+        (pd.to_datetime(closed["closed_date"]) -
+         pd.to_datetime(closed["added_date"])).dt.days.mean(), 1
+    ) if not closed.empty and "closed_date" in closed.columns else 0
+    sharpe = (closed["profit_pct"].mean() / closed["profit_pct"].std()
+              if not closed.empty and closed["profit_pct"].std() > 0 else 0)
+    return {
+        "total_trades": len(df), "closed_trades": total_closed,
+        "open_trades": len(open_t), "wins": wins, "losses": losses,
+        "win_rate": round(win_rate, 1), "avg_win": round(avg_win, 0),
+        "avg_loss": round(avg_loss, 0), "expectancy": round(exp, 0),
+        "profit_factor": round(gp / gl, 2), "max_drawdown": round(max_dd, 0),
+        "avg_hold_days": avg_hold, "sharpe": round(sharpe, 2)
+    }
 
 
-# ─── Sector Stock Discovery — FIX 9: uses unified engine, action="PICK" ───────
-def find_sector_picks(selected_sectors=None, max_per_sector=3):
-    picks = []
-    sectors = selected_sectors or list(SECTOR_STOCKS.keys())
-    all_symbols = []
-    for sector in sectors:
-        all_symbols.extend(SECTOR_STOCKS.get(sector, []))
-    all_symbols = all_symbols[:MAX_SCAN_SYMBOLS]
-    bulk_data = _bulk_fetch_history(all_symbols, period="1y")
+# ── Formatting helpers ─────────────────────────────────────────────────────────
+def fi(v):   return f"${v:,.0f}"    if not pd.isna(v) else "—"
+def fi2(v):  return f"${v:,.2f}"   if not pd.isna(v) else "—"
+def fp(v):   return f"{'+' if v >= 0 else ''}{v:.2f}%" if not pd.isna(v) else "—"
 
-    for sector in sectors:
-        spicks = []
-        for symbol in SECTOR_STOCKS.get(sector, []):
-            df  = bulk_data.get(symbol)
-            ind = compute_indicators(symbol, period="1y", prefetched_df=df)
-            if ind is None:
-                continue
-            if not ind.get("liquidity_ok", True):   # FIX 10: skip illiquid for new entries
-                continue
-            cmp, rsi = ind["cmp"], ind["rsi"]
-            score, reasons = 0, []
-            if rsi and 35 <= rsi <= 55: score += 15; reasons.append(f"RSI buy zone ({rsi})")
-            if ind["trend"] in ("Uptrend", "Strong Uptrend"): score += 20; reasons.append(ind["trend"])
-            elif ind["trend"] == "Recovery": score += 12; reasons.append("Recovery")
-            if ind["macd_bullish"]: score += 15; reasons.append("MACD bullish cross")
-            if ind.get("macd_hist_expanding"): score += 8; reasons.append("MACD momentum building")
-            if ind.get("supertrend_bullish"): score += 10; reasons.append("Supertrend bullish")
-            if ind["bb_pos"] < 0.3: score += 8; reasons.append("Lower BB bounce")
-            if ind.get("bb_squeeze"): score += 8; reasons.append("BB squeeze (pre-breakout)")
-            # VCP — Volatility Contraction Pattern (Minervini). Strong base = high conviction.
-            if ind.get("vcp"):
-                if ind.get("vcp_ready"):
-                    score += 22
-                    reasons.append(f"🎯 VCP pivot-ready ({ind.get('vcp_quality','')})")
+def cv_cell(v, fn):
+    if pd.isna(v):
+        return f"<td>{fn(v)}</td>"
+    if v > 0:
+        return f'<td class="profit-cell pos">{fn(v)}</td>'
+    if v < 0:
+        return f'<td class="profit-cell neg">{fn(v)}</td>'
+    return f'<td class="zero-cell">{fn(v)}</td>'
+
+def badge(status, profit=None):
+    if status == "Open":
+        return '<span class="badge b-open">Open</span>'
+    if profit is not None and profit < 0:
+        return '<span class="badge b-cll">Closed ✗</span>'
+    return '<span class="badge b-cl">Closed ✓</span>'
+
+def card(lbl, val, sub="", cls=""):
+    sub_html = f'<div class="sub">{sub}</div>' if sub else ""
+    return f'<div class="card"><div class="lbl">{lbl}</div><div class="val {cls}">{val}</div>{sub_html}</div>'
+
+
+# ── Chart helpers ──────────────────────────────────────────────────────────────
+def base_layout(fig, title):
+    fig.update_layout(
+        title=dict(text=title, font=dict(size=14, color="#f8fafc", weight="bold"), x=.01),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#cbd5e1", size=11), margin=dict(l=8, r=8, t=45, b=8))
+    fig.update_xaxes(gridcolor="#334155", zerolinecolor="#334155", tickfont=dict(color="#cbd5e1"))
+    fig.update_yaxes(gridcolor="#334155", zerolinecolor="#334155", tickfont=dict(color="#cbd5e1"))
+    return fig
+
+
+def chart_alloc(df):
+    g = df.groupby("stock")["invested"].sum().reset_index()
+    return base_layout(go.Figure(go.Pie(
+        labels=g["stock"], values=g["invested"], hole=0.4,
+        marker=dict(colors=px.colors.qualitative.Dark24,
+                    line=dict(color="rgba(0,0,0,0)", width=0)),
+        textinfo="percent+label", textfont=dict(size=11, color="#ffffff")
+    )), "Portfolio Allocation")
+
+
+def chart_pnl(df):
+    d = df.sort_values("profit")
+    fig = base_layout(go.Figure(go.Bar(
+        x=d["profit"], y=d["stock"], orientation="h",
+        marker=dict(color=["#ef4444" if v < 0 else "#10b981" for v in d["profit"]],
+                    line=dict(width=0)),
+        text=[fp(p) for p in d["profit_pct"]],
+        textposition="outside", textfont=dict(color="#f8fafc", size=10)
+    )), "P&L by Stock")
+    fig.update_layout(showlegend=False, margin=dict(l=8, r=55, t=45, b=8))
+    fig.update_xaxes(tickprefix="$")
+    return fig
+
+
+def chart_donut(df):
+    c = df["status"].value_counts().reset_index()
+    c.columns = ["Status", "Count"]
+    fig = base_layout(go.Figure(go.Pie(
+        labels=c["Status"], values=c["Count"], hole=.6,
+        marker=dict(
+            colors=[{"Open": "#f59e0b", "Closed": "#10b981"}.get(s, "#94a3b8")
+                    for s in c["Status"]],
+            line=dict(color="rgba(0,0,0,0)", width=0)),
+        textinfo="percent+value", textfont=dict(size=12, color="#ffffff")
+    )), "Open vs Closed")
+    fig.add_annotation(
+        text=f"<b>{len(df)}</b><br><span style='font-size:10px'>TRADES</span>",
+        font=dict(size=18, color="#f8fafc"), showarrow=False, x=.5, y=.5)
+    return fig
+
+
+def chart_growth(hist, cur_val, cur_inv):
+    today = datetime.now().strftime("%Y-%m-%d")
+    rows = hist[["snapshot_date", "total_invested", "current_value"]].to_dict("records")
+    if not hist.empty and hist.iloc[-1]["snapshot_date"] != today:
+        rows.append({"snapshot_date": today,
+                     "total_invested": cur_inv, "current_value": cur_val})
+    elif hist.empty:
+        rows = [{"snapshot_date": today,
+                 "total_invested": cur_inv, "current_value": cur_val}]
+    d = pd.DataFrame(rows)
+    fig = base_layout(go.Figure([
+        go.Scatter(x=pd.to_datetime(d["snapshot_date"]), y=d["current_value"],
+                   name="Value", line=dict(color="#10b981", width=3),
+                   fill="tozeroy", fillcolor="rgba(16,185,129,0.1)"),
+        go.Scatter(x=pd.to_datetime(d["snapshot_date"]), y=d["total_invested"],
+                   name="Invested", line=dict(color="#3b82f6", width=2, dash="dash"))
+    ]), "Portfolio Growth")
+    fig.update_layout(hovermode="x unified")
+    fig.update_yaxes(tickprefix="$")
+    return fig
+
+
+# ── Signal card renderer ──────────────────────────────────────────────────────
+def _fmt_rr(rr):
+    if rr is None:
+        return "—"
+    if rr > 10:
+        return f'<span class="rr-warn">⚠️ {rr} (verify ATR)</span>'
+    if rr > 5:
+        return f'<span style="color:#f59e0b;font-weight:700">{rr}</span>'
+    return str(rr)
+
+
+def render_signals(signals, theme_t):
+    if not signals:
+        st.info("No signals available.")
+        return
+
+    html = '<div class="sig-grid">'
+    for s in signals:
+        action = s.get("action", "")
+        c = ("sell"  if "SELL"    in action else
+             "avg"   if "AVERAGE" in action else
+             "hold"  if "HOLD"    in action else "watch")
+        clr = (theme_t["red"]    if c == "sell"  else
+               theme_t["yellow"] if c == "avg"   else
+               theme_t["green"]  if c == "hold"  else theme_t["muted"])
+
+        cmp_v   = s.get("cmp")
+        rsi_v   = s.get("rsi")
+        pct     = s.get("pct_from_buy")
+        target  = s.get("target")
+        sl      = s.get("stop_loss")
+        rr      = s.get("risk_reward")
+        trend_v = s.get("trend", "—")
+        macd_v  = s.get("macd_signal", "—")
+        reason  = s.get("reason", "")
+        strength = s.get("strength", 30)
+
+        cmp_str = f"${cmp_v}" if cmp_v is not None else "—"
+        rsi_str = str(rsi_v)  if rsi_v is not None else "—"
+        pct_str = f"{pct:+.1f}%" if pct is not None else "—%"
+        tgt_str = f"${target}" if target is not None else "—"
+        sl_str  = f"${sl}"    if sl  is not None else "—"
+        rr_html = _fmt_rr(rr)
+
+        if c == "sell":
+            ph = (f"🎯 Exit: {tgt_str} | 🛑 Re-entry: {sl_str}<br>"
+                  f"📉 {trend_v} | MACD: {macd_v}")
+        elif c == "avg":
+            avg_p   = s.get("avg_price")
+            new_avg = s.get("new_avg")
+            new_sl  = s.get("new_sl")
+            ph = (f"💰 Avg: {'$'+str(avg_p) if avg_p else '—'} | "
+                  f"New Avg: {'$'+str(new_avg) if new_avg else '—'}<br>"
+                  f"🛑 SL: {'$'+str(new_sl) if new_sl else '—'} | 🎯 Target: {tgt_str}")
+        else:
+            ph = (f"🎯 Target: {tgt_str} | 🛑 SL: {sl_str}<br>"
+                  f"📊 R:R {rr_html} | {trend_v}")
+
+        # ── Build badges as clean single-line strings (no multi-line f-string
+        #    expressions, which can break Streamlit's HTML rendering) ──────────
+        badge_new = ""
+        if s.get("limited_history"):
+            badge_new = (f'<span style="font-size:.62rem;background:rgba(245,158,11,.15);'
+                         f'color:#f59e0b;padding:.1rem .4rem;border-radius:4px;'
+                         f'font-weight:700;margin-left:.3rem">🆕 {s.get("bars","")}d history</span>')
+
+        badge_vcp = ""
+        if s.get("vcp"):
+            _vq = s.get("vcp_quality") or ""
+            _vr = "▸READY" if s.get("vcp_ready") else ""
+            badge_vcp = (f'<span style="font-size:.62rem;background:rgba(16,185,129,.18);'
+                         f'color:#10b981;padding:.1rem .4rem;border-radius:4px;'
+                         f'font-weight:700;margin-left:.3rem">🎯 VCP {_vq}{_vr}</span>')
+
+        badge_rs = ""
+        _rsr = s.get("rs_ratio")
+        if s.get("rs_outperforming") and isinstance(_rsr, (int, float)):
+            badge_rs = (f'<span style="font-size:.62rem;background:rgba(59,130,246,.18);'
+                        f'color:#3b82f6;padding:.1rem .4rem;border-radius:4px;'
+                        f'font-weight:700;margin-left:.3rem">💪 RS {_rsr:.2f}</span>')
+
+        badges = badge_new + badge_vcp + badge_rs
+
+        html += f"""
+<div class="sig-card {c}">
+  <div class="sig-action" style="color:{clr}">{action}</div>
+  <div style="font-size:.9rem;font-weight:800;margin-bottom:.3rem">
+    {s.get('stock','')}
+    <span style="font-size:.7rem;color:var(--muted);font-weight:400">{s.get('sector','')}</span>
+    {badges}
+  </div>
+  <div class="sig-meta">CMP {cmp_str} · RSI {rsi_str} · {pct_str}</div>
+  <div class="sig-reason">{reason}</div>
+  <div class="sig-price">{ph}</div>
+  <div class="str-bar">
+    <div class="str-fill" style="width:{strength}%;background:{clr}"></div>
+  </div>
+</div>"""
+
+    # Collapse leading whitespace on each line — prevents Streamlit's markdown
+    # parser from ever treating indented HTML as a code block (which would show
+    # the raw <span> tags as literal text).
+    html_clean = "\n".join(line.lstrip() for line in (html + "</div>").split("\n"))
+    st.markdown(html_clean, unsafe_allow_html=True)
+
+
+# ── Sector table renderer ─────────────────────────────────────────────────────
+def render_sector(sdf, t):
+    if sdf is None or sdf.empty:
+        return
+
+    def medal(rank):
+        return "🥇" if rank == 1 else "🥈" if rank == 2 else "🥉" if rank == 3 else "📊"
+
+    rows = ""
+    for _, r in sdf.iterrows():
+        rs = r.get("rs_vs_nifty_1m", 0) or 0
+        rs_clr = "#10b981" if rs > 0 else "#ef4444"
+        avg_rsi = r["avg_rsi"]
+        rsi_str = f"{avg_rsi:.0f}" if avg_rsi and not pd.isna(avg_rsi) else "—"
+        rows += (
+            f"<tr>"
+            f"<td style='font-weight:700'>{medal(r['rank'])} #{int(r['rank'])}</td>"
+            f"<td><b style='font-size:.9rem'>{r['sector']}</b></td>"
+            f"<td style='color:var(--muted);font-size:.75rem'>{r['stocks']}</td>"
+            f"<td style='text-align:center;font-weight:600'>{rsi_str}</td>"
+            f"<td style='text-align:right'>"
+            f"  <span class='{'pos' if r['avg_pct'] > 0 else 'neg'}'>"
+            f"  {r['avg_pct']:+.1f}%</span></td>"
+            f"<td style='text-align:right;font-size:.8rem'>"
+            f"  <span style='color:{rs_clr};font-weight:700'>{rs:+.1f}%</span></td>"
+            f"<td style='font-size:.8rem;font-weight:600'>"
+            f"  {r.get('rrg_quadrant', '—')}</td>"
+            f"<td>"
+            f"  <div style='background:{t['input']};height:6px;width:100%;border-radius:4px'>"
+            f"    <div style='background:{t['accent']};"
+            f"         width:{min(r['momentum_score'] * 100, 100):.0f}%;"
+            f"         height:6px;border-radius:4px'></div></div>"
+            f"  <span style='font-size:.75rem;font-weight:600'>"
+            f"  {r['momentum_score']:.2f}</span></td>"
+            f"</tr>"
+        )
+
+    st.markdown(
+        f'<div class="tbl-wrap"><table class="sector-tbl">'
+        f'<thead><tr>'
+        f'<th>Rank</th><th>Sector</th><th>Top Movers</th>'
+        f'<th style="text-align:center">RSI</th>'
+        f'<th style="text-align:right">1M Chg</th>'
+        f'<th style="text-align:right">vs S&P</th>'
+        f'<th>RRG</th>'
+        f'<th>Momentum</th>'
+        f'</tr></thead><tbody>{rows}</tbody></table></div>',
+        unsafe_allow_html=True
+    )
+
+
+def render_outlook(odf, t):
+    if odf is None or odf.empty:
+        return
+    cards_html = ""
+    for _, r in odf.iterrows():
+        outlook = r["outlook"]
+        clr = t["green"] if any(x in outlook for x in ["Bullish", "Power", "Strong"]) \
+              else t["red"]
+        avg_rsi = r.get("avg_rsi")
+        rsi_str = f"{avg_rsi:.0f}" if avg_rsi and not pd.isna(avg_rsi) else "—"
+        cards_html += (
+            f"<div class='outlook-card'>"
+            f"<div style='font-weight:700;margin-bottom:.3rem'>{r['sector']}</div>"
+            f"<div style='color:{clr};font-weight:800;font-size:.9rem'>{outlook}</div>"
+            f"<div class='sig-meta' style='margin-top:.4rem'>"
+            f"Conf: {r['confidence']}% · Mom: {r['momentum']:.2f}<br>"
+            f"RSI: {rsi_str} · Chg: {r['avg_pct']:+.1f}%</div>"
+            f"</div>"
+        )
+    st.markdown(f'<div class="outlook-grid">{cards_html}</div>', unsafe_allow_html=True)
+
+
+def render_picks(picks, t):
+    if not picks:
+        return
+    cards_html = ""
+    for p in picks:
+        brd = t["green"] if p["score"] >= 70 else t["yellow"] if p["score"] >= 55 else t["muted"]
+        cards_html += (
+            f"<div class='pick-card' style='border-top-color:{brd}'>"
+            f"<div style='font-weight:800'>{p['stock']} "
+            f"<span class='pick-sector'>{p['sector']}</span></div>"
+            f"<div style='font-size:.8rem;color:var(--muted);font-weight:600;margin-top:3px'>"
+            f"CMP ${p['cmp']} · RSI {p['rsi']} · {p['trend']}</div>"
+            f"<div class='pick-prices'>"
+            f"🎯 Entry: ${p['entry']}<br>"
+            f"🚀 Target: ${p['target']}<br>"
+            f"🛑 SL: ${p['stop_loss']}<br>"
+            f"📊 R:R: {_fmt_rr(p['risk_reward'])} · Score: {p['score']}</div>"
+            f"<div class='pick-reason'>{p['reason']}</div>"
+            f"</div>"
+        )
+    st.markdown(f'<div class="pick-grid">{cards_html}</div>', unsafe_allow_html=True)
+
+
+# ── News renderer ─────────────────────────────────────────────────────────────
+def render_news(news_list):
+    if not news_list:
+        st.info("No recent news found for your current holdings.")
+        return
+    for item in news_list:
+        st.markdown(
+            f'<div class="news-item">{item}</div>',
+            unsafe_allow_html=True
+        )
+
+
+# ── Score dashboard ────────────────────────────────────────────────────────────
+def render_score_dashboard():
+    scores = [
+        ("RSI (Wilder's)",          9, "adjust=False + explicit 100/0 edge case — matches TradingView"),
+        ("MACD",                    9, "Single-pass crossover, adjust=False, histogram + momentum flags"),
+        ("Bollinger Bands",         8, "bb_pos clamped [0,1], bandwidth + squeeze + breakout flags"),
+        ("ATR",                     9, "Wilder's EWM smoothing — stops now match Zerodha/TV"),
+        ("Supertrend",              9, "Numpy array loop, Wilder ATR(10), mult 2.5 for NSE swing"),
+        ("VWAP",                    8, "20-day rolling VWAP + price_vs_vwap % deviation"),
+        ("EMA / Trend",             8, "Slope flags (rising/flattening), momentum-fading label, EMA200 back"),
+        ("Fibonacci",               8, "Swing-peak based via scipy with degenerate-swing fallback"),
+        ("Chart Patterns",          8, "Neckline + Cup&Handle + vol gates"),
+        ("Candlesticks",            8, "3-candle patterns, range normalization"),
+        ("Signal RR Engine",        9, "Unified _calc_risk_params with PICK mode — zero phantom RR"),
+        ("Sector Rotation",         8, "RRG quadrant + RS vs S&P"),
+        ("News Engine",             8, "yfinance v1.4 + RSS fallback"),
+        ("Liquidity Gate",          8, "Soft gate: liquidity_ok flag, ⚠️ shown on signal, gated for new picks"),
+        ("Unified Risk Engine",     9, "Scanner, picks, and portfolio signals all use one engine"),
+        ("Bull/Bear Trap Scanner",  9, "5-factor confluence: geometry · volume quality · RSI extreme · Supertrend · reversal candle. Proactive sweep of full US universe."),
+        ("Smart Money Concepts",    8, "FVG · Order Blocks · Liquidity Pools · Premium/Discount · Displacement. NSE circuit-filter aware, ATR-normalised thresholds."),
+        ("VCP (Volatility Contraction)", 8, "Minervini base detection: 2-4 tightening contractions, volume dry-up, pivot proximity, A+/A/B/C quality grading. Pivot-ready flag + dedicated scanner."),
+        ("Relative Strength vs S&P",   8, "IBD-style RS ratio (multi-period weighted) + 1-99 percentile rating across universe. Leaders boost conviction; laggards penalised. Dedicated RS Leaders ranking."),
+    ]
+    avg = sum(s[1] for s in scores) / len(scores)
+
+    st.markdown(f"""
+    <div style="background:var(--card);border:1px solid var(--border);border-radius:12px;
+         padding:1.2rem 1.5rem;margin-bottom:1.5rem">
+      <div style="font-size:.75rem;color:var(--muted);text-transform:uppercase;
+           letter-spacing:.08em;margin-bottom:.5rem">signals.py — Overall Score</div>
+      <div style="font-size:2.5rem;font-weight:800;color:var(--accent)">{avg:.1f}<span
+           style="font-size:1rem;color:var(--muted);font-weight:400"> / 10</span></div>
+      <div style="font-size:.8rem;color:var(--muted);margin-top:.3rem">
+        Core engine v12 (Wilder ATR/RSI, numpy Supertrend, 20-day VWAP, swing-peak
+        Fibonacci, unified risk engine) plus momentum stack: Trap detection, Smart
+        Money Concepts, VCP base detection, and Relative Strength leadership ranking.
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    rows_html = ""
+    for name, score, note in scores:
+        fill = min(score * 10, 100)
+        clr = ("#10b981" if score >= 8 else "#f59e0b" if score >= 6 else "#ef4444")
+        rows_html += f"""
+<div style="margin-bottom:.8rem">
+  <div style="display:flex;justify-content:space-between;align-items:center;
+       margin-bottom:.3rem">
+    <span style="font-size:.85rem;font-weight:600;color:var(--text)">{name}</span>
+    <span style="font-size:.85rem;font-weight:800;color:{clr}">{score}/10</span>
+  </div>
+  <div style="background:var(--input);height:5px;border-radius:3px;margin-bottom:.3rem">
+    <div style="background:{clr};width:{fill}%;height:5px;border-radius:3px"></div>
+  </div>
+  <div style="font-size:.75rem;color:var(--muted)">{note}</div>
+</div>"""
+
+    st.markdown(
+        f'<div style="background:var(--card);border:1px solid var(--border);'
+        f'border-radius:12px;padding:1.2rem 1.5rem">{rows_html}</div>',
+        unsafe_allow_html=True
+    )
+
+
+# ── Load & Enrich Data ─────────────────────────────────────────────────────────
+raw = get_trades(UID)
+df  = enrich(raw) if not raw.empty else raw.copy()
+
+if (st.session_state.last_refresh is None or
+        (datetime.now() - st.session_state.last_refresh).seconds >= _TTL):
+    st.session_state.last_refresh = datetime.now()
+
+# ── Tiered background scan ─────────────────────────────────────────────────────
+# FAST TIER (every 5 min):  portfolio signals + news (the core dashboard)
+# DEEP TIER (every 15 min): sector rotation + picks + universe scanner + SMC scan
+#
+# CRITICAL LOAD-ORDER FIX:
+# On first login the dashboard must RENDER FIRST, then scan. Otherwise the page
+# blocks on the full deep scan (can be minutes) before login even completes.
+# We use a `first_render_done` flag: the very first run after login skips all
+# scanning, renders the dashboard immediately, and schedules a rerun. From the
+# 2nd run onward the scans fire normally in the background.
+_now = time.time()
+
+open_raw = raw[raw["status"] == "Open"] if not raw.empty else pd.DataFrame()
+_trade_hash = (hash(tuple(sorted(open_raw["id"].tolist())))
+               if not open_raw.empty else 0)
+_trades_changed = (_trade_hash != st.session_state._trade_hash)
+
+# User-configurable intervals (seconds) and auto-scan toggles
+_fast_interval = st.session_state.get("fast_interval_sec", 300)   # default 5 min
+_deep_interval = st.session_state.get("deep_interval_sec", 900)   # default 15 min
+_auto_fast = st.session_state.get("auto_fast", True)
+_auto_deep = st.session_state.get("auto_deep", True)
+
+if not st.session_state.get("first_render_done", False):
+    # PASS 1 — first paint after login: render immediately, defer ALL scanning.
+    st.session_state.first_render_done = True
+    _fast_due = False
+    _deep_due = False
+    st.session_state._kickoff_scan = True
+    st.session_state._scan_stage = "fast"
+elif st.session_state.get("_scan_stage") == "fast":
+    # PASS 2 — fast scan only (signals + news). Then kick off the deep sequence.
+    _fast_due = True
+    _deep_due = True
+    st.session_state._deep_running = True
+    st.session_state._deep_stage = "sector"
+    st.session_state._scan_stage = "done"
+elif st.session_state.get("_deep_running", False):
+    # Deep scan mid-sequence — keep advancing (handled in post-render block).
+    _fast_due = False
+    _deep_due = True
+else:
+    # Steady state — scans fire only on their configured schedules (if auto on).
+    st.session_state._scan_stage = "done"
+    _fast_due = (_auto_fast and
+                 (st.session_state.last_auto_scan == 0.0 or
+                  (_now - st.session_state.last_auto_scan) >= _fast_interval))
+    # Deep auto-trigger: start a fresh sequence when interval elapses
+    _deep_elapsed = (st.session_state.last_slow_scan == 0.0 or
+                     (_now - st.session_state.last_slow_scan) >= _deep_interval)
+    _deep_due = False
+    if _auto_deep and _deep_elapsed:
+        st.session_state._deep_running = True
+        st.session_state._deep_stage = "sector"
+        _deep_due = True
+    # Manual deep-scan request starts the sequence too
+    if st.session_state.get("_manual_deep_request", False):
+        st.session_state._manual_deep_request = False
+        st.session_state._deep_running = True
+        st.session_state._deep_stage = "sector"
+        _deep_due = True
+    # Manual fast-scan request
+    if st.session_state.get("_manual_fast_request", False):
+        st.session_state._manual_fast_request = False
+        _fast_due = True
+
+if _fast_due:
+    n_open = len(open_raw)
+    _spinner_msg = (f"🔔 Refreshing {n_open} signal{'s' if n_open!=1 else ''}…"
+                    if n_open > 0 else "🔔 Refreshing market data…")
+    with st.spinner(_spinner_msg):
+        try:
+            if _trades_changed or st.session_state.signals_cache is None:
+                st.session_state.signals_cache = (
+                    generate_signals(open_raw) if not open_raw.empty else [])
+                st.session_state.news_cache = (
+                    fetch_portfolio_news(open_raw) if not open_raw.empty else [])
+                st.session_state._trade_hash = _trade_hash
+            st.session_state.last_auto_scan = _now
+        except Exception as _e:
+            st.session_state.last_auto_scan = _now
+            st.toast(f"⚠️ Signal refresh error: {_e}", icon="⚠️")
+
+if _deep_due:
+    # Deep scan is due — but we DEFER its execution to the very END of the script
+    # (after the whole page renders) so it never blocks or interrupts your view.
+    # The actual stage execution happens in the post-render block at the bottom.
+    st.session_state._run_deep_now = True
+else:
+    st.session_state._run_deep_now = False
+
+
+# ── Portfolio metrics ──────────────────────────────────────────────────────────
+if not df.empty:
+    odf = df[df["status"] == "Open"]
+    cdf = df[df["status"] == "Closed"]
+    # Invested & current (portfolio) value reflect ONLY open positions — money
+    # tied up in stocks you still hold. Sold/closed positions are excluded
+    # because that capital has been freed up (their result lives in realized P&L).
+    t_inv    = odf["invested"].sum()    if not odf.empty else 0
+    t_cur    = odf["current_amt"].sum() if not odf.empty else 0
+    t_real   = cdf["profit"].sum()   if not cdf.empty else 0   # realized (closed)
+    t_unreal = odf["profit"].sum()   if not odf.empty else 0   # unrealized (open)
+    t_pnl    = t_real + t_unreal       # total P&L across realized + unrealized
+    # Return % is measured against invested capital. Use total cost basis
+    # (open invested + the original cost of closed trades) so realized gains
+    # aren't divided by zero when everything is sold.
+    _closed_cost = cdf["invested"].sum() if not cdf.empty else 0
+    _pnl_base = t_inv + _closed_cost
+    t_pnl_pct = t_pnl / _pnl_base * 100 if _pnl_base > 0 else 0
+    best  = df.loc[df["profit_pct"].idxmax(), "stock"]
+    worst = df.loc[df["profit_pct"].idxmin(), "stock"]
+    save_snapshot(UID, t_inv, t_cur)
+else:
+    odf = cdf = pd.DataFrame()
+    t_inv = t_cur = t_real = t_unreal = t_pnl = t_pnl_pct = 0
+    best = worst = "—"
+
+theme_t = THEMES[st.session_state.theme]
+st.markdown(theme_css(theme_t), unsafe_allow_html=True)
+
+# ── Sidebar ────────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown(
+        f'<div style="font-size:.85rem;font-weight:800;color:var(--accent);'
+        f'margin-bottom:1rem">👤 {(st.session_state.username or "Trader").upper()}</div>',
+        unsafe_allow_html=True)
+
+    # ── DB persistence status badge ────────────────────────────────────────────
+    if _DB_STATUS == "postgres":
+        st.markdown(
+            '<div style="font-size:.7rem;font-weight:700;color:#10b981;'
+            'background:rgba(16,185,129,.1);border:1px solid rgba(16,185,129,.3);'
+            'border-radius:6px;padding:.3rem .6rem;margin-bottom:.8rem">'
+            '🟢 Postgres connected — data persists</div>',
+            unsafe_allow_html=True)
+    elif _DB_STATUS == "sqlite_fallback":
+        st.markdown(
+            '<div style="font-size:.7rem;font-weight:700;color:#ef4444;'
+            'background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3);'
+            'border-radius:6px;padding:.3rem .6rem;margin-bottom:.8rem">'
+            '🔴 Postgres failed — using temporary storage. '
+            'Check DATABASE_URL secret.</div>',
+            unsafe_allow_html=True)
+        if _DB_ERROR:
+            with st.expander("⚠️ DB error detail"):
+                st.code(_DB_ERROR[:300])
+    else:
+        st.markdown(
+            '<div style="font-size:.7rem;font-weight:700;color:#f59e0b;'
+            'background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.3);'
+            'border-radius:6px;padding:.3rem .6rem;margin-bottom:.8rem">'
+            '🟡 Local storage (data resets on restart). '
+            'Add DATABASE_URL to persist.</div>',
+            unsafe_allow_html=True)
+
+    # ── Scan depth (coverage vs speed) ─────────────────────────────────────────
+    # Controls how many of the most-liquid symbols EVERY scanner sweeps. Custom
+    # tickers (us_custom.csv) and all ETFs are always included on top of this.
+    import signals as _sig_mod
+    _depth_opts = {
+        "⚡ Fast — top 600":            600,
+        "⚖️ Balanced — top 1,500":      1500,
+        "🔭 Deep — top 3,000":          3000,
+        f"🌌 Max — all {UNIVERSE_TOTAL:,}": UNIVERSE_TOTAL,
+    }
+    _depth_label = st.selectbox(
+        "🔍 Scan depth", list(_depth_opts.keys()), index=1,
+        help="How many of the most-liquid symbols each scanner sweeps. Your "
+             "custom tickers and all ETFs are always scanned regardless. Higher = "
+             "broader coverage but slower; very large scans can be rate-limited by Yahoo.")
+    MAX_SCAN_SYMBOLS = _depth_opts[_depth_label]   # rebinds app-level name (display)
+    _sig_mod.MAX_SCAN_SYMBOLS = MAX_SCAN_SYMBOLS    # drives signals.get_scan_symbols()
+
+    if st.button("🚪 Logout", width="stretch"):
+        controller.set("swing_user_id", "", max_age=0)
+        st.session_state.clear()
+        st.rerun()
+
+    st.markdown("<hr style='margin:1rem 0;border-color:var(--border)'>",
+                unsafe_allow_html=True)
+    st.markdown('<div style="font-size:.8rem;font-weight:800;letter-spacing:.05em">'
+                '🎨 UI THEME</div>', unsafe_allow_html=True)
+
+    new_theme = st.selectbox(
+        "Theme", list(THEMES.keys()),
+        index=list(THEMES.keys()).index(st.session_state.theme),
+        label_visibility="collapsed")
+    if new_theme != st.session_state.theme:
+        st.session_state.theme = new_theme
+        st.rerun()
+
+    st.markdown("<hr style='margin:.8rem 0;border-color:var(--border)'>",
+                unsafe_allow_html=True)
+    st.markdown('<div style="font-size:.8rem;font-weight:800;letter-spacing:.05em;'
+                'margin-bottom:.5rem">🗺 NAVIGATION</div>', unsafe_allow_html=True)
+
+    NAV_GROUPS = {
+        "📊 Portfolio": [
+            ("📋 Overview",          "portfolio"),
+            ("📊 Charts",            "analytics"),
+            ("📈 Stock Chart",       "chart"),
+            ("📐 Metrics",           "metrics"),
+            ("📤 Export",            "export"),
+        ],
+        "🔔 Signals & Alerts": [
+            ("🔔 Active Signals",    "signals"),
+            ("🪤 Trap Scanner",      "traps"),
+            ("🏦 Smart Money (SMC)", "smc"),
+            ("📐 VCP Scanner",       "vcp"),
+        ],
+        "🔄 Market Intelligence": [
+            ("🔄 Sector Rotation",   "sector"),
+            ("💪 RS Leaders",        "rs"),
+            ("🌌 Universe Scanner",  "scanner"),
+            ("📊 Market Breadth",    "breadth"),
+            ("🔬 Custom Screener",   "screener"),
+            ("📅 Corporate Actions", "corp_actions"),
+            ("📆 Earnings Calendar", "earnings"),
+            ("🆕 IPO Tracker",       "ipo"),
+        ],
+        "🛡 Risk & Sizing": [
+            ("🧮 Position Sizing",   "sizing"),
+            ("🛡 Risk Dashboard",    "risk"),
+        ],
+        "🛠 Tools": [
+            ("👁 Watchlist",         "watchlist"),
+            ("🔔 Price Alerts",      "alerts"),
+            ("📓 Trade Journal",     "journal"),
+            ("🎯 Signal Scores",     "scores"),
+        ],
+    }
+    # Flat list for radio
+    nav_labels = [label for group in NAV_GROUPS.values() for label, _ in group]
+    nav_keys   = [key   for group in NAV_GROUPS.values() for _, key   in group]
+
+    if "active_page" not in st.session_state:
+        st.session_state.active_page = "portfolio"
+
+    # Group headers + radio buttons styled with CSS
+    nav_html = ""
+    flat_idx = 0
+    for group_label, items in NAV_GROUPS.items():
+        nav_html += (f'<div style="font-size:.65rem;font-weight:800;color:var(--muted);'
+                     f'text-transform:uppercase;letter-spacing:.1em;margin:.6rem 0 .2rem;'
+                     f'padding-left:.3rem">{group_label}</div>')
+        flat_idx += len(items)
+
+    # Use radio for actual selection (CSS handles grouping visually)
+    cur_idx = nav_keys.index(st.session_state.active_page) \
+              if st.session_state.active_page in nav_keys else 0
+    sel_nav = st.radio(
+        "nav", nav_labels, index=cur_idx,
+        label_visibility="collapsed")
+    new_page = nav_keys[nav_labels.index(sel_nav)]
+    if new_page != st.session_state.active_page:
+        st.session_state.active_page = new_page
+        st.rerun()
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown('<div style="font-size:1.1rem;font-weight:800;color:var(--accent);'
+                'margin-bottom:.8rem">⚡ Trade Entry</div>', unsafe_allow_html=True)
+
+    em   = st.session_state.edit_id is not None
+    erow = (raw[raw["id"] == st.session_state.edit_id].iloc[0]
+            if em and not raw.empty else None)
+    if em:
+        st.markdown(
+            '<div style="background:rgba(99,102,241,.15);border:1px solid rgba(99,102,241,.4);'
+            'border-radius:8px;padding:.5rem;font-size:.8rem;color:var(--accent);'
+            'margin-bottom:1rem;font-weight:700">✏️ Editing trade</div>',
+            unsafe_allow_html=True)
+
+    with st.form("trade_form", clear_on_submit=True):
+        s_in   = st.text_input("Stock Symbol",
+                               value=erow["stock"] if erow is not None else "",
+                               placeholder="AAPL, NVDA…")
+        q_in   = st.number_input("Quantity", min_value=1, step=1,
+                                 value=int(erow["quantity"]) if erow is not None else 1)
+        b_in   = st.number_input("Buy At $", min_value=0.01, step=0.05,
+                                 value=float(erow["buy_at"]) if erow is not None else 0.01,
+                                 format="%.2f")
+        sel_in = st.number_input(
+            "Sell At $ (optional)", min_value=0.0, step=0.05,
+            value=float(erow["sell_at"]) if (erow is not None and erow["sell_at"]) else 0.0,
+            format="%.2f")
+
+        if st.form_submit_button(
+                "💾 Update Trade" if em else "➕ Execute Entry", width="stretch"):
+            if not s_in.strip():
+                st.error("Symbol required")
+            elif b_in <= 0:
+                st.error("Buy price must be > 0")
+            else:
+                sv = sel_in if sel_in > 0 else None
+                if em:
+                    update_trade(st.session_state.edit_id, UID, s_in, q_in, b_in,
+                                 sv, "Closed" if sv else "Open")
+                    st.session_state.edit_id = None
+                    st.success("Updated!")
                 else:
-                    score += 12
-                    reasons.append(f"📐 VCP base ({ind.get('vcp_quality','')})")
-            # Relative Strength vs Nifty — leaders get a conviction boost
-            _rs = ind.get("rs_ratio")
-            if _rs is not None:
-                if _rs >= 1.15:
-                    score += 12; reasons.append(f"💪 Strong leader (RS {_rs:.2f})")
-                elif _rs >= 1.0:
-                    score += 6; reasons.append(f"Outperforming Nifty (RS {_rs:.2f})")
-                elif _rs < 0.85:
-                    score -= 8   # laggard — reduce conviction for new longs
-            if ind["vol_ratio"] > 1.3: score += 8; reasons.append(f"Vol surge ({ind['vol_ratio']:.1f}x)")
-            if ind.get("bear_trap"): score += 20; reasons.append(f"🪤 Bear Trap (conf {ind.get('bear_trap_conf',0)}%)")
-            if ind.get("bull_trap"): score -= 25  # avoid buying into a bull trap
-            # SMC confluence — institutional structure boosts/reduces conviction
-            _smc_score = ind.get("smc_score", 0)
-            if _smc_score >= 35:
-                score += 12; reasons.append(f"🏦 Bullish SMC ({_smc_score:+d})")
-            elif _smc_score <= -35:
-                score -= 12
-            if ind.get("smc_zone") == "Discount":
-                score += 6; reasons.append("SMC Discount zone")
-            if ind.get("smc_at_bull_ob"):
-                score += 8; reasons.append("At bull Order Block")
-            if score < 45:
-                continue
+                    add_trade(UID, s_in, q_in, b_in, sv)
+                    st.success(f"Added {s_in.upper()}")
+                _CACHE.clear()
+                st.session_state.last_auto_scan = 0.0
+                st.rerun()
 
-            # FIX 9: unified engine — same numbers as everywhere else
-            atr = ind["atr"]
-            tgt, sl, rr = _calc_risk_params(cmp, atr, ind["resistance"], action="PICK")
-            if rr and rr < 1.5:
-                continue
+    if em and st.button("✖ Cancel Edit", width="stretch"):
+        st.session_state.edit_id = None
+        st.rerun()
 
-            patterns = ind.get("patterns", []); candles = ind.get("candlesticks", [])
-            all_pats = patterns + candles
-            pat_str  = " | ".join(all_pats) if all_pats else ""
-            final_reason = (f"[{pat_str}] " + " | ".join(reasons[:4])) if pat_str else " | ".join(reasons[:4])
-            spicks.append({"stock": symbol, "sector": sector, "cmp": cmp, "entry": round(cmp, 2),
-                           "target": tgt, "stop_loss": sl, "risk_reward": rr, "score": score,
-                           "rsi": rsi, "trend": ind["trend"], "reason": final_reason,
-                           "atr": atr, "support": ind["support"], "resistance": ind["resistance"]})
-        spicks.sort(key=lambda x: x["score"], reverse=True)
-        picks.extend(spicks[:max_per_sector])
-    picks.sort(key=lambda x: x["score"], reverse=True)
-    return picks
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown('<div style="font-size:.8rem;font-weight:800;letter-spacing:.05em">'
+                '🔍 FILTERS</div>', unsafe_allow_html=True)
+    st.session_state.filter_status = st.selectbox(
+        "Status", ["All", "Open", "Closed"],
+        index=["All", "Open", "Closed"].index(st.session_state.filter_status),
+        label_visibility="collapsed")
+    st.session_state.filter_pnl = st.selectbox(
+        "P&L", ["All", "Profitable", "Loss"],
+        index=["All", "Profitable", "Loss"].index(st.session_state.filter_pnl),
+        label_visibility="collapsed")
+    st.session_state.search = st.text_input(
+        "Search", value=st.session_state.search,
+        placeholder="Search symbol…", label_visibility="collapsed")
 
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown('<div style="font-size:.8rem;font-weight:800;letter-spacing:.05em">'
+                '⚙️ SCAN CONTROLS</div>', unsafe_allow_html=True)
 
-# ─── Telegram ─────────────────────────────────────────────────────────────────
-def send_telegram(bot_token, chat_id, message):
-    try:
-        resp = requests.post(
-            f"https://api.telegram.org/bot{bot_token}/sendMessage",
-            json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"}, timeout=10)
-        return resp.ok
-    except Exception:
-        return False
+    _interval_opts = {"5 min": 300, "15 min": 900, "30 min": 1800}
+    _interval_labels = list(_interval_opts.keys())
 
+    # Core (fast) scan controls
+    st.markdown('<div style="font-size:.72rem;color:var(--muted);font-weight:700;'
+                'margin:.5rem 0 .2rem">⚡ Core scan (signals · news · prices)</div>',
+                unsafe_allow_html=True)
+    fc1, fc2 = st.columns([1, 1])
+    with fc1:
+        st.session_state.auto_fast = st.toggle(
+            "Auto", value=st.session_state.auto_fast, key="toggle_fast")
+    with fc2:
+        _cur_fast = next((k for k, v in _interval_opts.items()
+                          if v == st.session_state.fast_interval_sec), "5 min")
+        _sel_fast = st.selectbox("Every", _interval_labels,
+                                 index=_interval_labels.index(_cur_fast),
+                                 key="sel_fast", label_visibility="collapsed")
+        st.session_state.fast_interval_sec = _interval_opts[_sel_fast]
+    if st.button("⚡ Scan Core Now", width="stretch"):
+        st.session_state._manual_fast_request = True
+        _cached_prices.clear()
+        st.rerun()
 
-def build_telegram_message(signals, sector_df, picks=None):
-    now = datetime.now().strftime("%d %b %Y %H:%M")
-    lines = [f"<b>📈 Swing Dashboard</b>  <i>{now}</i>\n"]
-    market = get_market_regime()
-    lines.append(f"🌐 <b>Market:</b> {market['regime']} | S&P {market.get('nifty_close', '—')} | RSI {market.get('nifty_rsi', '—')}")
-    for s in [s for s in signals if "SELL" in s["action"]]:
-        lines.append(f"🔴 <b>{s['stock']}</b> ${s['cmp']} | {s['reason']}")
-    for s in [s for s in signals if "AVERAGE" in s["action"]]:
-        lines.append(f"🟡 <b>{s['stock']}</b> ${s['cmp']} | Avg ${s.get('avg_price')} | New SL ${s.get('new_sl')}")
-    for s in [s for s in signals if "HOLD" in s["action"]]:
-        lines.append(f"🟢 <b>{s['stock']}</b> ${s['cmp']} | {s['reason']}")
-    if not sector_df.empty:
-        lines.append("\n🔄 <b>SECTORS</b>")
-        for _, r in sector_df.head(5).iterrows():
-            e = "🥇" if r["rank"] == 1 else "🥈" if r["rank"] == 2 else "📊"
-            lines.append(f"  {e} <b>{r['sector']}</b> Score {r['momentum_score']:.2f}")
-    if picks:
-        lines.append("\n🎯 <b>BUYS</b>")
-        for p in picks[:8]:
-            lines.append(f"  • <b>{p['stock']}</b> ${p['cmp']} | Tgt ${p['target']} | SL ${p['stop_loss']} | R:R {p['risk_reward']}")
-    lines.append("\n<i>Indicative only. Not investment advice.</i>")
-    return "\n".join(lines)
+    # Deep scan controls
+    st.markdown('<div style="font-size:.72rem;color:var(--muted);font-weight:700;'
+                'margin:.7rem 0 .2rem">🔄 Deep scan (sector · universe · SMC · trap · VCP · RS)</div>',
+                unsafe_allow_html=True)
+    dc1, dc2 = st.columns([1, 1])
+    with dc1:
+        st.session_state.auto_deep = st.toggle(
+            "Auto", value=st.session_state.auto_deep, key="toggle_deep")
+    with dc2:
+        _cur_deep = next((k for k, v in _interval_opts.items()
+                          if v == st.session_state.deep_interval_sec), "15 min")
+        _sel_deep = st.selectbox("Every", _interval_labels,
+                                 index=_interval_labels.index(_cur_deep),
+                                 key="sel_deep", label_visibility="collapsed")
+        st.session_state.deep_interval_sec = _interval_opts[_sel_deep]
+    if st.button("🔄 Scan Deep Now", width="stretch"):
+        st.session_state._manual_deep_request = True
+        st.rerun()
 
+    # Status / countdown
+    _elapsed_fast = time.time() - st.session_state.last_auto_scan
+    _elapsed_slow = time.time() - st.session_state.last_slow_scan
+    _nxt_fast = max(0, int((st.session_state.fast_interval_sec - _elapsed_fast) // 60))
+    _nxt_slow = max(0, int((st.session_state.deep_interval_sec - _elapsed_slow) // 60))
+    _stage_names = {"sector": "Sector rotation", "universe": "Universe scan",
+                    "smc": "SMC setups", "traps": "Trap scan",
+                    "vcp": "VCP bases", "rs": "RS leaders"}
+    if st.session_state.get("_deep_running", False):
+        _cur = st.session_state.get("_deep_stage", "sector")
+        _deep_status = f'⏳ {_stage_names.get(_cur, _cur)}…'
+    else:
+        _deep_status = f'{_nxt_slow}m' if st.session_state.auto_deep else 'manual'
+    _fast_status = f'{_nxt_fast}m' if st.session_state.auto_fast else 'manual'
+    st.markdown(
+        f'<div style="font-size:.68rem;color:var(--muted);padding-top:.5rem;'
+        f'font-weight:600;line-height:1.6">'
+        f'⚡ core: {_fast_status} · 🔄 deep: {_deep_status}</div>',
+        unsafe_allow_html=True)
 
-# ─── Master Universe Scanner — FIX 9: unified engine + liquidity gate ─────────
-def generate_market_scanner():
-    all_symbols = get_scan_symbols()
-    bulk_data = _bulk_fetch_history(all_symbols, period="6mo")
-    results = []
-    for symbol in all_symbols:
-        sector = get_sector(symbol)
-        df  = bulk_data.get(symbol)
-        ind = compute_indicators(symbol, period="6mo", prefetched_df=df)
-        if not ind:
-            continue
-        if not ind.get("liquidity_ok", True):   # FIX 10: visible skip for new entries
-            continue
-        cmp, rsi, trend = ind["cmp"], ind["rsi"], ind["trend"]
-        patterns = ind.get("patterns", []); candles = ind.get("candlesticks", [])
-        score = 0
-        if trend in ("Uptrend", "Strong Uptrend"): score += 3
-        if ind.get("supertrend_bullish"): score += 2
-        if ind.get("macd_bullish"): score += 2
-        if ind.get("macd_hist_expanding"): score += 1
-        if ind.get("bb_squeeze"): score += 1
-        if rsi and 60 <= rsi <= 75: score += 3
-        if "🚀 Vol Breakout" in patterns: score += 5
-        if "🚩 Bull Flag Breakout" in patterns: score += 4
-        if "☕ Cup & Handle Breakout" in patterns: score += 4
-        if "🟩 Bullish Engulfing" in candles: score += 2
-        # VCP base adds conviction (pivot-ready more so)
-        if ind.get("vcp"):
-            score += 4 if ind.get("vcp_ready") else 2
-        # Relative strength leadership
-        _rs_sc = ind.get("rs_ratio")
-        if _rs_sc is not None:
-            if _rs_sc >= 1.15: score += 2
-            elif _rs_sc < 0.85: score -= 2
-        # Active trap is a warning — penalise
-        if ind.get("bull_trap") or ind.get("bear_trap"):
-            score -= 3
-        if ("📈 Double Top" in patterns or "🏔️ Head & Shoulders (Top)" in patterns or
-                "🟥 Bearish Engulfing" in candles):
-            score -= 5
-        if trend in ("Downtrend", "Strong Downtrend"): score -= 4
-        if score >= 8: signal = "🔥 STRONG BUY"
-        elif score >= 5: signal = "🟢 BUY SETUP"
-        elif score >= 2: signal = "🟡 ACCUMULATE"
-        elif score <= 0: signal = "🔴 AVOID"
-        else: signal = "⚪ NEUTRAL"
-        all_pats = patterns + candles
-        pat_str  = " | ".join(all_pats) if all_pats else "—"
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown('<div style="font-size:.8rem;font-weight:800;letter-spacing:.05em">'
+                '📱 TELEGRAM</div>', unsafe_allow_html=True)
 
-        # FIX 9: same unified engine as sector picks — identical numbers everywhere
-        atr = ind["atr"]
-        tgt, sl, _rr = _calc_risk_params(cmp, atr, ind["resistance"], action="PICK")
-
-        # ── VCP / Trap / RS columns (all from the same indicator computation) ──
-        if ind.get("vcp"):
-            vcp_str = f"🎯 {ind.get('vcp_quality','')}" + ("▸READY" if ind.get("vcp_ready") else "")
-        else:
-            vcp_str = "—"
-        if ind.get("bull_trap"):
-            trap_str = f"🐂 Bull trap ({ind.get('bull_trap_conf',0)}%)"
-        elif ind.get("bear_trap"):
-            trap_str = f"🐻 Bear trap ({ind.get('bear_trap_conf',0)}%)"
-        else:
-            trap_str = "—"
-        _rs_ratio = ind.get("rs_ratio")
-        rs_str = round(float(_rs_ratio), 2) if _rs_ratio is not None else None
-
-        results.append({
-            "Generated": datetime.now().strftime("%d %b %H:%M"), "Sector": sector,
-            "Stock": symbol, "CMP": float(cmp), "Entry": float(cmp),
-            "Target": float(tgt), "SL": float(sl), "Support": float(ind["support"]),
-            "Resist": float(ind["resistance"]), "Signal": signal, "Score": score,
-            "RSI": round(float(rsi), 2) if rsi else 0.0, "Trend": trend,
-            "VCP": vcp_str, "Trap": trap_str, "RS": rs_str,
-            "RS_Lead": "💪" if ind.get("rs_outperforming") else "",
-            "Patterns": pat_str,
-            "Turnover_M": round(ind.get("avg_turnover", 0) / 1e6, 1),
-            "Liquid": "✅" if ind.get("liquidity_ok", True) else "⚠️ Low",
-        })
-    if not results:
-        return pd.DataFrame()
-    return pd.DataFrame(results).sort_values(by=["Sector", "Score"], ascending=[True, False])
-
-
-# ==============================================================================
-# NEWS ENGINE (unchanged from v11 — already 8/10)
-# ==============================================================================
-def _parse_yf_news_item(item):
-    if not isinstance(item, dict):
-        return None, None
-    content = item.get("content", {})
-    if isinstance(content, dict) and content.get("title"):
-        title = content.get("title", "")
-        url_obj = content.get("clickThroughUrl") or content.get("canonicalUrl") or {}
-        link = url_obj.get("url", "") if isinstance(url_obj, dict) else str(url_obj)
-        return title, link
-    title = item.get("title", "")
-    link  = item.get("link", "") or item.get("url", "")
-    return (title, link) if title else (None, None)
-
-
-def _fetch_google_news_rss(query, max_items=2):
-    try:
-        q = requests.utils.quote(query)
-        url = f"https://news.google.com/rss/search?q={q}+NSE+India&hl=en-IN&gl=IN&ceid=IN:en"
-        resp = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
-        if not resp.ok:
-            return []
-        root = ET.fromstring(resp.content)
-        items = root.findall(".//item")[:max_items]
-        results = []
-        for it in items:
-            title_el = it.find("title")
-            link_el  = it.find("link")
-            if title_el is not None and title_el.text:
-                title = title_el.text.strip()
-                link  = link_el.text.strip() if link_el is not None and link_el.text else ""
-                results.append((title, link))
-        return results
-    except Exception:
-        return []
-
-
-def fetch_portfolio_news(open_trades_df):
-    if open_trades_df.empty:
-        return []
-    news_alerts = []
-    unique_symbols = open_trades_df["stock"].unique().tolist()
-    for sym in unique_symbols:
-        clean_sym = sanitize_ticker(sym)
-        found = False
-        try:
-            t     = yf.Ticker(_yahoo(clean_sym))
-            items = t.get_news(count=3)
-            if items:
-                for item in items[:2]:
-                    title, link = _parse_yf_news_item(item)
-                    if title:
-                        if link:
-                            news_alerts.append(
-                                f"📰 <b>{clean_sym}</b>: "
-                                f"<a href='{link}' style='color:var(--accent);text-decoration:none'>{title}</a>")
-                        else:
-                            news_alerts.append(f"📰 <b>{clean_sym}</b>: {title}")
-                        found = True
-        except Exception:
-            pass
-        if not found:
+    # Load from DB first; fall back to st.secrets; cache in session_state
+    # so values survive within-session navigation without a DB re-read.
+    if "tg_tok_saved" not in st.session_state or "tg_cid_saved" not in st.session_state:
+        db_tok, db_cid = get_tg_config(UID)
+        if not db_tok:
             try:
-                rss_items = _fetch_google_news_rss(clean_sym, max_items=1)
-                for title, link in rss_items:
-                    if link:
-                        news_alerts.append(
-                            f"📰 <b>{clean_sym}</b>: "
-                            f"<a href='{link}' style='color:var(--accent);text-decoration:none'>{title}</a>")
+                db_tok = st.secrets.get("telegram_bot_token", "")
+                db_cid = st.secrets.get("telegram_chat_id", "")
+            except Exception:
+                db_tok = db_cid = ""
+        st.session_state.tg_tok_saved = db_tok or ""
+        st.session_state.tg_cid_saved = db_cid or ""
+
+    saved_tok = st.session_state.tg_tok_saved
+    saved_cid = st.session_state.tg_cid_saved
+
+    tg_tok = st.text_input("Bot Token", value=saved_tok, type="password")
+    tg_cid = st.text_input("Chat ID",   value=saved_cid)
+    if st.button("💾 Save Config", width="stretch"):
+        save_tg_config(UID, tg_tok, tg_cid)
+        st.session_state.tg_tok_saved = tg_tok
+        st.session_state.tg_cid_saved = tg_cid
+        st.success("Saved!")
+
+# ── Header ─────────────────────────────────────────────────────────────────────
+st.markdown(
+    '<div class="dash-title">'
+    '<div class="dash-title-text">📈 Quantitative <span class="hl">Swing Dashboard</span></div>'
+    '<span class="refresh-badge">⚡ SIGNALS LIVE · 🔄 SECTOR LIVE</span>'
+    '</div>',
+    unsafe_allow_html=True)
+
+market = _get_market_regime_safe()
+regime = market.get("regime", "Unknown")
+
+rc_map = {
+    "Strong Bull":  ("rgba(16,185,129,.15)",  "#10b981", "border:1px solid rgba(16,185,129,.4)"),
+    "Bull":         ("rgba(16,185,129,.1)",   "#10b981", "border:1px solid rgba(16,185,129,.2)"),
+    "Bull Pullback":("rgba(245,158,11,.15)",  "#f59e0b", "border:1px solid rgba(245,158,11,.4)"),
+    "Strong Bear":  ("rgba(239,68,68,.15)",   "#ef4444", "border:1px solid rgba(239,68,68,.4)"),
+    "Bear":         ("rgba(239,68,68,.1)",    "#ef4444", "border:1px solid rgba(239,68,68,.2)"),
+    "Bear Rally":   ("rgba(245,158,11,.15)",  "#f59e0b", "border:1px solid rgba(245,158,11,.4)"),
+}
+rc_bg, rc_clr, rc_border = rc_map.get(
+    regime, ("rgba(148,163,184,.1)", "#94a3b8", "border:1px solid rgba(148,163,184,.3)"))
+
+indices_html = ""
+_idx_items = market.get("indices", {})
+for name, d in _idx_items.items():
+    price = d.get("price")
+    chg   = d.get("chg_pct", 0)
+    price_str = f"${price:,.0f}" if price else "—"
+    if name == "VIX":
+        chg_clr = "var(--red)" if chg > 0 else "var(--green)"
+    else:
+        chg_clr = "var(--green)" if chg > 0 else "var(--red)"
+    indices_html += (
+        f'<span style="color:var(--text);font-size:.8rem;padding:0 .8rem;'
+        f'border-right:1px solid rgba(255,255,255,.1)">'
+        f'{name} <b>{price_str}</b> '
+        f'<span style="color:{chg_clr};font-weight:700">{chg:+.2f}%</span></span>'
+    )
+if not _idx_items:
+    # Indices failed to load — show a clear note instead of a blank banner
+    indices_html = (
+        '<span style="color:var(--muted);font-size:.78rem;padding:0 .8rem">'
+        '📡 Index data loading… (Yahoo Finance may be rate-limited; '
+        'refreshes automatically)</span>'
+    )
+
+sup_str = f"${market.get('support'):,.0f}" if market.get("support") else "—"
+res_str = f"${market.get('resistance'):,.0f}" if market.get("resistance") else "—"
+
+st.markdown(
+    f'<div class="regime-banner" style="background:{rc_bg};{rc_border};'
+    f'backdrop-filter:blur(10px)">'
+    f'<span style="color:{rc_clr};font-weight:800;font-size:.9rem;'
+    f'white-space:nowrap;letter-spacing:.05em">'
+    f'🌐 {regime.upper()} (CONF: {market.get("confidence","—")}%)</span>'
+    f'{indices_html}'
+    f'<span style="color:var(--muted);font-size:.75rem;white-space:nowrap;'
+    f'padding-left:.5rem;font-weight:600">'
+    f'SUP: {sup_str} | RES: {res_str} | '
+    f'RSI {market.get("nifty_rsi","—")} | RISK: {market.get("risk_level","—")}'
+    f'</span></div>',
+    unsafe_allow_html=True)
+
+# ── KPI cards ──────────────────────────────────────────────────────────────────
+pnl_c = "green" if t_pnl >= 0 else "red"
+r_c   = "green" if t_real >= 0 else "red"
+u_c   = "green" if t_unreal >= 0 else "red"
+
+st.markdown(
+    '<div class="cards">'
+    + card("Total Invested",  fi(t_inv),    "",          "blue")
+    + card("Portfolio Value", fi(t_cur),    "",          "blue")
+    + card("Total P&L",       fi(t_pnl),    fp(t_pnl_pct), pnl_c)
+    + card("Realized P&L",    fi(t_real),   "",          r_c)
+    + card("Unrealized P&L",  fi(t_unreal), "",          u_c)
+    + card("Open Trades",     str(len(odf)), "Active",   "yellow")
+    + card("Closed Trades",   str(len(cdf)), "Historical","green" if len(cdf) > 0 else "")
+    + card("Best Trade 🏆",   best,          "",         "green")
+    + card("Worst Trade 📉",  worst,         "",         "red")
+    + '</div>',
+    unsafe_allow_html=True)
+
+# ── Tabs ────────────────────────────────────────────────────────────────────────
+# ── Page routing — driven by sidebar navigation ────────────────────────────────
+_page = st.session_state.get("active_page", "portfolio")
+
+# ── Portfolio ────────────────────────────────────────────────────────────────
+if _page == 'portfolio':
+    if df.empty:
+        st.info("No trades yet. Use the sidebar to execute an entry.")
+    else:
+        fdf = df.copy()
+        if st.session_state.filter_status != "All":
+            fdf = fdf[fdf["status"] == st.session_state.filter_status]
+        if st.session_state.filter_pnl == "Profitable":
+            fdf = fdf[fdf["profit"] > 0]
+        elif st.session_state.filter_pnl == "Loss":
+            fdf = fdf[fdf["profit"] < 0]
+        if st.session_state.search.strip():
+            fdf = fdf[fdf["stock"].str.upper().str.contains(
+                st.session_state.search.upper())]
+
+        sort_opts = {
+            "Stock": "stock", "Qty": "quantity", "Buy At": "buy_at",
+            "CMP": "cmp", "Invested": "invested",
+            "P&L $": "profit", "P&L %": "profit_pct"
+        }
+        sc1, sc2 = st.columns([3, 1])
+        with sc1:
+            sort_key = st.selectbox(
+                "Sort by", list(sort_opts.keys()),
+                index=list(sort_opts.values()).index(st.session_state.sort_col)
+                if st.session_state.sort_col in sort_opts.values() else 0,
+                label_visibility="collapsed")
+            sort_col = sort_opts[sort_key]
+        with sc2:
+            asc = st.toggle("⬆ Ascending", value=st.session_state.sort_asc)
+            st.session_state.sort_asc = asc
+
+        st.session_state.sort_col = sort_col
+        if sort_col in fdf.columns:
+            fdf = fdf.sort_values(sort_col, ascending=asc, na_position="last")
+
+        st.markdown(
+            f'<div class="sec">Open Positions & History ({len(fdf)})</div>',
+            unsafe_allow_html=True)
+
+        rows_html = ""
+        for _, r in fdf.iterrows():
+            row_cls = ("row-profit" if r.get("profit", 0) > 0
+                       else "row-loss" if r.get("profit", 0) < 0 else "row-neutral")
+            cmp_cell = (
+                '<td class="zero-cell">—</td>' if pd.isna(r.get("cmp"))
+                else f'<td class="pos">{fi2(r["cmp"])}</td>' if r["cmp"] > r["buy_at"]
+                else f'<td class="neg">{fi2(r["cmp"])}</td>' if r["cmp"] < r["buy_at"]
+                else f'<td>{fi2(r["cmp"])}</td>'
+            )
+            cur_cell = (
+                '<td>—</td>' if pd.isna(r.get("current_amt", 0))
+                else f'<td class="pos">{fi(r["current_amt"])}</td>'
+                     if r["current_amt"] > r["invested"]
+                else f'<td class="neg">{fi(r["current_amt"])}</td>'
+                     if r["current_amt"] < r["invested"]
+                else f'<td>{fi(r["current_amt"])}</td>'
+            )
+            rows_html += (
+                f"<tr class='{row_cls}'>"
+                f"<td class='l'><span class='nse-lbl'>{r.get('nse_label','')}</span></td>"
+                f"<td class='l'><b style='font-size:.9rem'>{r['stock']}</b><br>"
+                f"<span style='font-size:.7rem;color:var(--muted)'>"
+                f"{get_sector(r['stock'])} · {r.get('added_date','')}</span></td>"
+                f"<td>{int(r['quantity'])}</td>"
+                f"<td>{fi2(r['buy_at'])}</td>"
+                f"{cmp_cell}"
+                f"<td>{'—' if pd.isna(r.get('sell_at')) else fi2(r['sell_at'])}</td>"
+                f"<td>{fi(r['invested'])}</td>"
+                f"{cur_cell}"
+                f"{cv_cell(r.get('profit', 0), fi)}"
+                f"{cv_cell(r.get('profit_pct', 0), fp)}"
+                f"<td>{badge(r['status'], r.get('profit', 0))}</td>"
+                f"</tr>"
+            )
+
+        st.markdown(
+            f'<div class="tbl-wrap"><table class="t"><thead><tr>'
+            f'<th class="l">NSE</th><th class="l">Asset</th>'
+            f'<th>Qty</th><th>Entry</th><th>CMP</th><th>Exit</th>'
+            f'<th>Invested</th><th>Value</th><th>P&L $</th><th>P&L %</th>'
+            f'<th>Status</th></tr></thead><tbody>{rows_html}</tbody></table></div>',
+            unsafe_allow_html=True)
+
+        st.markdown('<div class="sec">Manage Positions</div>', unsafe_allow_html=True)
+        opts = [f"{r['id']} — {r['stock']}" for _, r in fdf.iterrows()]
+        if opts:
+            ca, cb, cc, cd = st.columns([3, 1, 1, 1])
+            with ca:
+                sel_id = int(
+                    st.selectbox("Select Trade ID", opts,
+                                 label_visibility="collapsed").split(" — ")[0])
+            with cb:
+                if st.button("✏️ Modify", width="stretch"):
+                    st.session_state.edit_id = sel_id
+                    st.rerun()
+            with cc:
+                if st.button("🔒 Close Pos", width="stretch"):
+                    st.session_state.close_id = sel_id
+                    st.rerun()
+            with cd:
+                if st.button("🗑 Drop", width="stretch"):
+                    st.session_state.del_id = sel_id
+                    st.rerun()
+
+        if st.session_state.close_id:
+            st.markdown("---")
+            st.markdown("**Execute Close — Confirm Exit Price**")
+            sp = st.number_input("Exit Price $", min_value=0.01, step=0.05, format="%.2f")
+            x1, x2 = st.columns(2)
+            with x1:
+                if st.button("✅ Confirm Exit", width="stretch"):
+                    close_trade(st.session_state.close_id, UID, sp)
+                    st.session_state.close_id = None
+                    st.rerun()
+            with x2:
+                if st.button("✖ Abort", width="stretch"):
+                    st.session_state.close_id = None
+                    st.rerun()
+
+        if st.session_state.del_id:
+            st.markdown("---")
+            st.warning(
+                f"Drop trade ID #{st.session_state.del_id}? This is irreversible.")
+            y1, y2 = st.columns(2)
+            with y1:
+                if st.button("🗑 Confirm Drop", width="stretch"):
+                    delete_trade(st.session_state.del_id, UID)
+                    st.session_state.del_id = None
+                    st.rerun()
+            with y2:
+                if st.button("✖ Abort", width="stretch"):
+                    st.session_state.del_id = None
+                    st.rerun()
+
+# ── Charts / Analytics ───────────────────────────────────────────────────────
+elif _page == 'analytics':
+    if df.empty:
+        st.info("Execute trades to populate visualization models.")
+    else:
+        c1, c2 = st.columns(2)
+        with c1:
+            st.plotly_chart(chart_alloc(df), use_container_width=True)
+        with c2:
+            st.plotly_chart(chart_donut(df), use_container_width=True)
+        st.plotly_chart(chart_pnl(df), use_container_width=True)
+        st.plotly_chart(
+            chart_growth(get_history(UID), t_cur, t_inv),
+            use_container_width=True)
+
+        # ── Enhanced analytics (Batch 2) ──────────────────────────────────────
+        st.markdown("<hr style='border-color:var(--border);margin:1.5rem 0'>",
+                    unsafe_allow_html=True)
+        st.markdown('<div class="sec">📊 Performance Breakdown</div>',
+                    unsafe_allow_html=True)
+
+        closed = df[df["status"] == "Closed"].copy()
+
+        ec1, ec2 = st.columns(2)
+
+        # 1. P&L by sector (realized, closed trades)
+        with ec1:
+            if not closed.empty:
+                closed["sector"] = closed["stock"].apply(get_sector)
+                sec_pnl = closed.groupby("sector")["profit"].sum().sort_values()
+                colors = ["#ef4444" if v < 0 else "#10b981" for v in sec_pnl.values]
+                bfig = go.Figure(go.Bar(
+                    x=sec_pnl.values, y=sec_pnl.index, orientation="h",
+                    marker_color=colors))
+                bfig.update_layout(
+                    title="Realized P&L by Sector", height=300,
+                    margin=dict(l=10, r=10, t=40, b=10),
+                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                    font=dict(color=theme_t.get("text", "#fff")))
+                bfig.update_xaxes(gridcolor="rgba(255,255,255,0.05)")
+                st.plotly_chart(bfig, use_container_width=True)
+            else:
+                st.info("No closed trades yet for sector P&L.")
+
+        # 2. Win/Loss distribution
+        with ec2:
+            if not closed.empty:
+                wins = len(closed[closed["profit"] > 0])
+                losses = len(closed[closed["profit"] < 0])
+                be = len(closed[closed["profit"] == 0])
+                pfig = go.Figure(go.Pie(
+                    labels=["Wins", "Losses", "Breakeven"],
+                    values=[wins, losses, be], hole=0.5,
+                    marker_colors=["#10b981", "#ef4444", "#f59e0b"]))
+                pfig.update_layout(
+                    title="Win / Loss Distribution", height=300,
+                    margin=dict(l=10, r=10, t=40, b=10),
+                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                    font=dict(color=theme_t.get("text", "#fff")))
+                st.plotly_chart(pfig, use_container_width=True)
+            else:
+                st.info("No closed trades yet for win/loss split.")
+
+        # 3. Best & worst trades
+        if not closed.empty:
+            st.markdown("##### 🏆 Best & Worst Closed Trades")
+            closed_sorted = closed.sort_values("profit_pct", ascending=False)
+            bw1, bw2 = st.columns(2)
+            with bw1:
+                st.markdown("**🟢 Top 5 Winners**")
+                top5 = closed_sorted.head(5)[["stock", "profit", "profit_pct"]].copy()
+                top5.columns = ["Stock", "P&L $", "P&L %"]
+                st.dataframe(top5, width="stretch", hide_index=True)
+            with bw2:
+                st.markdown("**🔴 Top 5 Losers**")
+                bot5 = closed_sorted.tail(5)[["stock", "profit", "profit_pct"]].copy()
+                bot5 = bot5.sort_values("P&L %" if "P&L %" in bot5.columns else "profit_pct")
+                bot5.columns = ["Stock", "P&L $", "P&L %"]
+                st.dataframe(bot5, width="stretch", hide_index=True)
+
+        # 4. Holding period distribution
+        if not closed.empty and "closed_date" in closed.columns:
+            try:
+                closed["hold_days"] = (
+                    pd.to_datetime(closed["closed_date"]) -
+                    pd.to_datetime(closed["added_date"])).dt.days
+                valid_hold = closed["hold_days"].dropna()
+                if not valid_hold.empty:
+                    st.markdown("##### ⏱ Holding Period Distribution")
+                    hfig = go.Figure(go.Histogram(
+                        x=valid_hold, marker_color="#3b82f6", nbinsx=20))
+                    hfig.update_layout(
+                        height=260, margin=dict(l=10, r=10, t=10, b=10),
+                        xaxis_title="Days held", yaxis_title="Trades",
+                        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                        font=dict(color=theme_t.get("text", "#fff")))
+                    hfig.update_xaxes(gridcolor="rgba(255,255,255,0.05)")
+                    hfig.update_yaxes(gridcolor="rgba(255,255,255,0.05)")
+                    st.plotly_chart(hfig, use_container_width=True)
+                    avg_hold = valid_hold.mean()
+                    st.caption(f"Average holding period: {avg_hold:.0f} days")
+            except Exception:
+                pass
+
+# ── Active Signals ───────────────────────────────────────────────────────────
+elif _page == 'signals':
+    st.markdown(
+        '<div class="sec">Active Portfolio Signals & Risk Management</div>',
+        unsafe_allow_html=True)
+
+    s1, s2 = st.columns([2, 1])
+    with s1:
+        st.caption("🤖 Neural background scan refreshes every 15 minutes.")
+    with s2:
+        if st.button("📲 Push to Telegram", width="stretch",
+                     disabled=not bool(saved_tok and saved_cid)):
+            if st.session_state.signals_cache is not None:
+                with st.spinner("🤖 Compiling Telegram report..."):
+                    msg_payload = build_telegram_message(
+                        st.session_state.signals_cache,
+                        st.session_state.sector_cache
+                        if st.session_state.sector_cache is not None else pd.DataFrame(),
+                        st.session_state.picks_cache
+                        if st.session_state.picks_cache is not None else []
+                    )
+                    news = st.session_state.news_cache or []
+                    if news:
+                        msg_payload += "\n\n🌍 <b>LATEST HOLDINGS NEWS</b>\n"
+                        msg_payload += "\n".join(news[:8])
+                    ok = send_telegram(saved_tok, saved_cid, msg_payload)
+                    if ok:
+                        st.success("✅ Broadcast successful!")
                     else:
-                        news_alerts.append(f"📰 <b>{clean_sym}</b>: {title}")
-            except Exception:
-                continue
-    return news_alerts
-
-
-# ==============================================================================
-# BULL TRAP & BEAR TRAP DETECTION — v12 addition
-# ==============================================================================
-# Bull Trap: Price fakes a breakout above resistance → collapses back.
-#            Lures buyers into a losing long. Strong SELL signal.
-# Bear Trap: Price fakes a breakdown below support → snaps back up.
-#            Lures sellers into a losing short. Strong BUY/AVERAGE signal.
-#
-# Detection uses 5-factor confluence scoring (each factor adds confidence):
-#   1. False breakout/breakdown geometry (price action)
-#   2. Volume quality on the fake move (weak = not a real breakout)
-#   3. RSI extreme at the fake move (overbought/oversold confirmation)
-#   4. Supertrend direction alignment
-#   5. Candle confirmation on the reversal bar
-# ==============================================================================
-
-
-# ==============================================================================
-# VCP — VOLATILITY CONTRACTION PATTERN  (Mark Minervini)
-# ==============================================================================
-# A proper VCP base, not just a Bollinger squeeze. We look for:
-#   1. A prior uptrend (the stock must be a leader, not a falling knife).
-#   2. A sequence of 2-4 pullbacks ("contractions") inside a base.
-#   3. Each contraction SHALLOWER than the one before (e.g. -25% -> -13% -> -7%).
-#   4. Volume drying up through the base (right side quieter than left).
-#   5. Price coiled near the top of the base, close to the pivot (breakout point).
-#   6. A "ready" flag when the final contraction is tight and price hugs pivot.
-#
-# Returns a dict with is_vcp, vcp_ready, contractions, pivot, quality, detail.
-# ==============================================================================
-def detect_vcp(close, high, low, vol, atr, lookback=80):
-    out = {
-        "is_vcp": False, "vcp_ready": False, "contractions": [],
-        "n_contractions": 0, "pivot": None, "pivot_distance_pct": None,
-        "volume_dryup": False, "base_length": 0, "quality": None, "detail": ""
-    }
-    n = len(close)
-    if n < 30:
-        return out
-
-    c = close.values.astype(float)
-    h = high.values.astype(float)
-    l = low.values.astype(float)
-    v = vol.values.astype(float)
-
-    start = max(0, n - lookback)
-    seg_c = c[start:]; seg_h = h[start:]; seg_l = l[start:]; seg_v = v[start:]
-    m = len(seg_c)
-    if m < 25:
-        return out
-
-    cmp = float(c[-1])
-
-    # 1. Prior uptrend / leadership gate: must be basing in the top of its range
-    seg_hi = float(seg_h.max()); seg_lo = float(seg_l.min())
-    if seg_hi <= seg_lo:
-        return out
-    pos_in_range = (cmp - seg_lo) / (seg_hi - seg_lo)
-    if pos_in_range < 0.55:
-        out["detail"] = "Not near base highs"
-        return out
-
-    # 2. Find swing pivots (fractal highs & lows) with ATR prominence
-    prom = max(atr * 0.5, cmp * 0.005)
-    swing_hi_idx = []; swing_lo_idx = []
-    for i in range(2, m - 2):
-        if (seg_h[i] >= seg_h[i-1] and seg_h[i] >= seg_h[i-2]
-                and seg_h[i] >= seg_h[i+1] and seg_h[i] >= seg_h[i+2]
-                and (seg_h[i] - min(seg_l[i-2:i+3])) >= prom):
-            swing_hi_idx.append(i)
-        if (seg_l[i] <= seg_l[i-1] and seg_l[i] <= seg_l[i-2]
-                and seg_l[i] <= seg_l[i+1] and seg_l[i] <= seg_l[i+2]
-                and (max(seg_h[i-2:i+3]) - seg_l[i]) >= prom):
-            swing_lo_idx.append(i)
-
-    if len(swing_hi_idx) < 2 or len(swing_lo_idx) < 1:
-        out["detail"] = "Not enough swings for a base"
-        return out
-
-    # 3. Measure contractions: each peak -> following trough drawdown
-    contractions = []
-    for pk in swing_hi_idx:
-        later_lows = [lo for lo in swing_lo_idx if lo > pk]
-        if not later_lows:
-            continue
-        tr = later_lows[0]
-        peak_price = seg_h[pk]; trough_price = seg_l[tr]
-        if peak_price > 0:
-            depth = (peak_price - trough_price) / peak_price * 100.0
-            if depth > 0.5:
-                contractions.append(round(depth, 1))
-
-    contractions = contractions[-4:]          # most recent base, up to 4 legs
-    # Collapse consecutive near-duplicates (same peak caught by adjacent fractals)
-    deduped = []
-    for d in contractions:
-        if not deduped or abs(deduped[-1] - d) > 1.0:
-            deduped.append(d)
-    contractions = deduped[-4:]
-    if len(contractions) < 2:
-        out["detail"] = "Fewer than 2 contractions"
-        return out
-
-    out["contractions"] = contractions
-    out["n_contractions"] = len(contractions)
-
-    # 4. Each contraction shallower than the previous (allow one noise violation)
-    violations = sum(1 for i in range(1, len(contractions))
-                     if contractions[i] > contractions[i-1] + 1.0)
-    tightening = violations <= 1 and contractions[-1] < contractions[0]
-    final_tight = contractions[-1] <= 12.0
-
-    # 5. Volume dry-up: right third quieter than left third
-    third = max(3, m // 3)
-    left_vol = float(np.mean(seg_v[:third])) if third < m else float(np.mean(seg_v))
-    right_vol = float(np.mean(seg_v[-third:]))
-    volume_dryup = right_vol < left_vol * 0.85 if left_vol > 0 else False
-    out["volume_dryup"] = volume_dryup
-
-    # 6. Pivot = highest high of base; distance from current price
-    pivot = float(seg_h.max())
-    pivot_distance_pct = (pivot - cmp) / cmp * 100.0 if cmp > 0 else 999
-    out["pivot"] = round(pivot, 2)
-    out["pivot_distance_pct"] = round(pivot_distance_pct, 2)
-    out["base_length"] = m
-
-    is_vcp = bool(tightening and len(contractions) >= 2 and pos_in_range >= 0.55)
-    out["is_vcp"] = is_vcp
-
-    if is_vcp:
-        vcp_ready = bool(final_tight and 0 <= pivot_distance_pct <= 6.0)
-        out["vcp_ready"] = vcp_ready
-        score = 0
-        if len(contractions) >= 3: score += 1
-        if tightening and violations == 0: score += 1
-        if final_tight: score += 1
-        if volume_dryup: score += 1
-        if pivot_distance_pct <= 8: score += 1
-        out["quality"] = "A+" if score >= 5 else "A" if score >= 4 else "B" if score >= 3 else "C"
-        seq = " -> ".join(f"-{x}%" for x in contractions)
-        ready_txt = "PIVOT-READY" if vcp_ready else f"{pivot_distance_pct:.1f}% below pivot"
-        vdry = " · vol dry-up" if volume_dryup else ""
-        out["detail"] = f"{len(contractions)} contractions ({seq}){vdry} · {ready_txt}"
-    else:
-        out["detail"] = "Contractions not tightening"
-
-    return out
-
-
-def detect_trap_signals(close, high, low, vol, vol_avg, rsi_series,
-                        supertrend_bullish, resistance, support,
-                        candles, atr, high52, low52, window=15,
-                        market_regime=None):
-    """
-    Detects bull traps (false breakout above resistance) and bear traps
-    (false breakdown below support).
-
-    SCORING v4 — ATR-normalised, RSI-at-peak, distribution-aware:
-    =========================================================================
-    KEY UPGRADES OVER v3:
-      • ATR-NORMALISED magnitude: spike/failure measured in ATR multiples,
-        not raw % — so a 3% move on a low-volatility large-cap scores higher
-        than a 3% move on a high-volatility small-cap (where 3% is noise).
-      • RSI-AT-PEAK: RSI is read at the breakout bar (where the trap formed),
-        not today's cooled-off value.
-      • FAILURE-BAR VOLUME: heavy volume on the rejection = distribution,
-        a much stronger trap confirmation than weak fade.
-      • REPEATED REJECTION: counts how many times this level rejected price
-        in the lookback — a level that rejected 3× is a real wall.
-      • 52-WEEK PROXIMITY: traps near 52w highs/lows = institutional
-        distribution/accumulation zones, weighted higher.
-      • MARKET-REGIME CONTEXT: a bull trap in a bear market is far more
-        reliable than one during a strong bull (where it's just a pullback).
-
-    Geometry:
-       [pre-period bars -60..-16] → pre_resistance / pre_support + rejection count
-       [window     bars -15..-1 ] → breakout + RSI-at-peak + breakout vol
-       [current    bar  0       ] → failure confirmed + failure-bar vol
-
-    Scoring (max 100, fires at >= 55):
-       Base geometry                      18
-       1. Spike magnitude (ATR-norm)    0-20
-       2. Failure depth (ATR-norm)      0-16
-       3. Breakout volume quality       0-12
-       4. Failure-bar volume (distrib)  0-12
-       5. RSI-at-peak extreme           0-12
-       6. Repeated rejection (wall)     0-10
-       7. Reversal candle               0-10
-       8. 52-week proximity             0-8
-       9. Market regime alignment       0-8
-      10. Supertrend (light confirm)    0-6
-    =========================================================================
-    """
-    result = {
-        "bull_trap": False, "bear_trap": False,
-        "bull_trap_conf": 0, "bear_trap_conf": 0,
-        "bull_trap_detail": "", "bear_trap_detail": ""
-    }
-
-    if len(close) < window + 25:
-        return result
-
-    cmp     = float(close.iloc[-1])
-    pre_idx = -(window + 1)
-    atr_safe = max(atr, cmp * 0.005)          # floor ATR to avoid div-by-zero
-
-    # ── Pre-window S/R (close-based, computed BEFORE the trap window) ─────────
-    if len(close) >= window + 21:
-        pre_resistance = float(close.rolling(20).max().iloc[pre_idx])
-        pre_support    = float(close.rolling(20).min().iloc[pre_idx])
-    else:
-        pre_resistance = float(close.iloc[:pre_idx].tail(20).max())
-        pre_support    = float(close.iloc[:pre_idx].tail(20).min())
-
-    tol = max(atr * 0.3, pre_resistance * 0.003)
-
-    # Window slices
-    win_close = close.iloc[-window:]
-    win_vol   = vol.iloc[-window:]
-    win_high  = high.iloc[-window:]
-    win_low   = low.iloc[-window:]
-
-    # RSI series aligned to window (for RSI-at-peak)
-    try:
-        win_rsi = rsi_series.iloc[-window:].values
-    except Exception:
-        win_rsi = None
-
-    # Regime flags
-    regime = (market_regime or {}).get("regime", "") if isinstance(market_regime, dict) else ""
-    is_bear_mkt = regime in ("Strong Bear", "Bear", "Bear Rally")
-    is_bull_mkt = regime in ("Strong Bull", "Bull")
-
-    # ── BULL TRAP ──────────────────────────────────────────────────────────────
-    breakout_idx = [i for i, c in enumerate(win_close.values)
-                    if float(c) > pre_resistance + tol]
-    failed_up = cmp < pre_resistance - tol
-
-    if breakout_idx and failed_up:
-        bo_closes = [float(win_close.values[i]) for i in breakout_idx]
-        bo_vols   = [float(win_vol.values[i])   for i in breakout_idx]
-        peak_i    = breakout_idx[int(np.argmax([float(win_close.values[i]) for i in breakout_idx]))]
-        max_spike = max(bo_closes)
-
-        # ATR-normalised magnitudes
-        spike_atrs   = (max_spike - pre_resistance) / atr_safe
-        failure_atrs = (pre_resistance - cmp) / atr_safe
-        spike_pct    = (max_spike - pre_resistance) / max(pre_resistance, 1) * 100
-        failure_pct  = (pre_resistance - cmp) / max(pre_resistance, 1) * 100
-
-        # Hard gates: at least 0.7 ATR breakout AND 0.4 ATR failure
-        if spike_atrs >= 0.7 and failure_atrs >= 0.4:
-            conf = 18
-            detail = [f"Failed breakout ${pre_resistance:.1f} (+{spike_pct:.1f}%)"]
-
-            # 1. Spike magnitude (ATR-normalised)
-            if   spike_atrs >= 3.0: conf += 20; detail.append(f"strong spike {spike_atrs:.1f}ATR")
-            elif spike_atrs >= 1.8: conf += 13; detail.append(f"moderate spike {spike_atrs:.1f}ATR")
-            elif spike_atrs >= 0.7: conf += 6
-
-            # 2. Failure depth (ATR-normalised)
-            if   failure_atrs >= 2.5: conf += 16; detail.append(f"deep rejection {failure_atrs:.1f}ATR")
-            elif failure_atrs >= 1.2: conf += 9;  detail.append(f"clear rejection {failure_atrs:.1f}ATR")
-            elif failure_atrs >= 0.4: conf += 4
-
-            # 3. Breakout volume quality (weak = fake breakout)
-            avg_bo_vol = sum(bo_vols) / len(bo_vols)
-            bo_vr = avg_bo_vol / max(vol_avg, 1)
-            if   bo_vr < 1.0: conf += 12; detail.append(f"weak breakout vol ({bo_vr:.1f}x)")
-            elif bo_vr < 1.8: conf += 6;  detail.append(f"soft breakout vol ({bo_vr:.1f}x)")
-
-            # 4. Failure-bar volume (heavy = distribution = strong)
-            fail_vol_ratio = float(win_vol.values[-1]) / max(vol_avg, 1)
-            if   fail_vol_ratio >= 2.0: conf += 12; detail.append(f"distribution vol ({fail_vol_ratio:.1f}x)")
-            elif fail_vol_ratio >= 1.3: conf += 6;  detail.append(f"elevated sell vol ({fail_vol_ratio:.1f}x)")
-
-            # 5. RSI AT PEAK (not today)
-            if win_rsi is not None and peak_i < len(win_rsi):
-                rsi_peak = win_rsi[peak_i]
-                if not np.isnan(rsi_peak):
-                    if   rsi_peak >= 75: conf += 12; detail.append(f"RSI {rsi_peak:.0f} at peak (extreme)")
-                    elif rsi_peak >= 68: conf += 7;  detail.append(f"RSI {rsi_peak:.0f} at peak")
-
-            # 6. Repeated rejection — how many times did price hit this zone & fail?
-            zone_lo, zone_hi = pre_resistance * 0.985, pre_resistance * 1.015
-            touches = int(((close.iloc[-60:] >= zone_lo) &
-                           (close.iloc[-60:] <= zone_hi)).sum())
-            if   touches >= 6: conf += 10; detail.append(f"strong wall ({touches} touches)")
-            elif touches >= 3: conf += 5;  detail.append(f"tested level ({touches} touches)")
-
-            # 7. Reversal candle
-            reject_candles = ["🟥 Bearish Engulfing", "💫 Shooting Star",
-                              "🌆 Evening Star", "🦅 Three Black Crows"]
-            matched = [c for c in reject_candles if c in candles]
-            if matched: conf += 10; detail.append(matched[0])
-
-            # 8. 52-week proximity (trap near 52w high = distribution zone)
-            if high52 and max_spike >= high52 * 0.97:
-                conf += 8; detail.append("near 52w high (distribution)")
-
-            # 9. Market regime: bull trap in bear market = high reliability
-            if is_bear_mkt: conf += 8; detail.append(f"{regime} context")
-            elif is_bull_mkt: conf -= 4    # likely just a pullback, not a trap
-
-            # 10. Supertrend (light confirm)
-            if supertrend_bullish is False:
-                conf += 6; detail.append("ST bearish")
-
-            if conf >= 55:
-                result["bull_trap"]        = True
-                result["bull_trap_conf"]   = int(min(max(conf, 0), 98))
-                result["bull_trap_detail"] = " | ".join(detail)
-
-    # ── BEAR TRAP ──────────────────────────────────────────────────────────────
-    breakdown_idx = [i for i, c in enumerate(win_close.values)
-                     if float(c) < pre_support - tol]
-    failed_dn = cmp > pre_support + tol
-
-    if breakdown_idx and failed_dn:
-        bd_closes = [float(win_close.values[i]) for i in breakdown_idx]
-        bd_vols   = [float(win_vol.values[i])   for i in breakdown_idx]
-        trough_i  = breakdown_idx[int(np.argmin([float(win_close.values[i]) for i in breakdown_idx]))]
-        max_drop  = min(bd_closes)
-
-        drop_atrs     = (pre_support - max_drop) / atr_safe
-        recovery_atrs = (cmp - pre_support) / atr_safe
-        drop_pct      = (pre_support - max_drop) / max(pre_support, 1) * 100
-        recovery_pct  = (cmp - pre_support) / max(pre_support, 1) * 100
-
-        if drop_atrs >= 0.7 and recovery_atrs >= 0.4:
-            conf = 18
-            detail = [f"Failed breakdown ${pre_support:.1f} (-{drop_pct:.1f}%)"]
-
-            # 1. Drop magnitude (ATR-norm)
-            if   drop_atrs >= 3.0: conf += 20; detail.append(f"strong drop {drop_atrs:.1f}ATR")
-            elif drop_atrs >= 1.8: conf += 13; detail.append(f"moderate drop {drop_atrs:.1f}ATR")
-            elif drop_atrs >= 0.7: conf += 6
-
-            # 2. Recovery depth (ATR-norm)
-            if   recovery_atrs >= 2.5: conf += 16; detail.append(f"strong recovery {recovery_atrs:.1f}ATR")
-            elif recovery_atrs >= 1.2: conf += 9;  detail.append(f"clear recovery {recovery_atrs:.1f}ATR")
-            elif recovery_atrs >= 0.4: conf += 4
-
-            # 3. Breakdown volume (weak = fake breakdown)
-            avg_bd_vol = sum(bd_vols) / len(bd_vols)
-            bd_vr = avg_bd_vol / max(vol_avg, 1)
-            if   bd_vr < 1.0: conf += 12; detail.append(f"weak breakdown vol ({bd_vr:.1f}x)")
-            elif bd_vr < 1.8: conf += 6;  detail.append(f"soft breakdown vol ({bd_vr:.1f}x)")
-
-            # 4. Recovery-bar volume (heavy = accumulation)
-            rec_vol_ratio = float(win_vol.values[-1]) / max(vol_avg, 1)
-            if   rec_vol_ratio >= 2.0: conf += 12; detail.append(f"accumulation vol ({rec_vol_ratio:.1f}x)")
-            elif rec_vol_ratio >= 1.3: conf += 6;  detail.append(f"elevated buy vol ({rec_vol_ratio:.1f}x)")
-
-            # 5. RSI AT TROUGH (not today)
-            if win_rsi is not None and trough_i < len(win_rsi):
-                rsi_trough = win_rsi[trough_i]
-                if not np.isnan(rsi_trough):
-                    if   rsi_trough <= 25: conf += 12; detail.append(f"RSI {rsi_trough:.0f} at trough (extreme)")
-                    elif rsi_trough <= 32: conf += 7;  detail.append(f"RSI {rsi_trough:.0f} at trough")
-
-            # 6. Repeated rejection at support
-            zone_lo, zone_hi = pre_support * 0.985, pre_support * 1.015
-            touches = int(((close.iloc[-60:] >= zone_lo) &
-                           (close.iloc[-60:] <= zone_hi)).sum())
-            if   touches >= 6: conf += 10; detail.append(f"strong floor ({touches} touches)")
-            elif touches >= 3: conf += 5;  detail.append(f"tested floor ({touches} touches)")
-
-            # 7. Recovery candle
-            recovery_candles = ["🟩 Bullish Engulfing", "🔨 Bullish Hammer",
-                                "🌅 Morning Star", "🪖 Three White Soldiers",
-                                "🛤️ Inverse H&S (Bottom)"]
-            matched = [c for c in recovery_candles if c in candles]
-            if matched: conf += 10; detail.append(matched[0])
-
-            # 8. 52-week proximity (trap near 52w low = accumulation zone)
-            if low52 and max_drop <= low52 * 1.03:
-                conf += 8; detail.append("near 52w low (accumulation)")
-
-            # 9. Market regime: bear trap in bull market = high reliability
-            if is_bull_mkt: conf += 8; detail.append(f"{regime} context")
-            elif is_bear_mkt: conf -= 4
-
-            # 10. Supertrend
-            if supertrend_bullish is True:
-                conf += 6; detail.append("ST bullish")
-
-            if conf >= 55:
-                result["bear_trap"]        = True
-                result["bear_trap_conf"]   = int(min(max(conf, 0), 98))
-                result["bear_trap_detail"] = " | ".join(detail)
-
-    return result
-
-
-def scan_for_traps(min_confidence=55):
-    """
-    Proactively sweeps all Nifty 500 stocks for live bull trap and bear trap
-    patterns. Unlike the embedded flags in generate_signals() which only cover
-    your portfolio, this function scans the FULL universe and surfaces every
-    trap currently forming — letting you act before you're already in a trade.
-
-    Returns:
-        {
-          "bull_traps"  : list[dict]  — sorted by confidence desc
-          "bear_traps"  : list[dict]  — sorted by confidence desc
-          "scanned"     : int         — total symbols attempted
-          "liquid"      : int         — symbols that passed liquidity gate
-          "bull_count"  : int
-          "bear_count"  : int
-          "timestamp"   : str
-        }
-
-    Each bull_trap entry:
-        stock, sector, cmp, rsi, confidence, detail,
-        support, resistance, atr, stop_loss, trend,
-        vol_ratio, supertrend_bullish
-
-    Each bear_trap entry (adds trade-ready params):
-        stock, sector, cmp, rsi, confidence, detail,
-        support, resistance, atr, entry, target,
-        stop_loss, risk_reward, trend, vol_ratio, supertrend_bullish
-    """
-    all_symbols = get_scan_symbols()
-
-    # Bulk fetch — single network pass for the whole universe
-    bulk_data = _bulk_fetch_history(all_symbols, period="6mo")
-
-    bull_traps = []
-    bear_traps = []
-    liquid_count = 0
-
-    for symbol in all_symbols:
-        try:
-            sector = get_sector(symbol)
-            df  = bulk_data.get(symbol)
-            ind = compute_indicators(symbol, period="6mo", prefetched_df=df)
-            if not ind:
-                continue
-            # Liquidity gate — no point alerting on stocks you can't trade
-            if not ind.get("liquidity_ok", True):
-                continue
-            liquid_count += 1
-
-            cmp = ind["cmp"]
-            atr = ind["atr"]
-
-            # ── Bull Trap alert ───────────────────────────────────────────────────
-            if ind.get("bull_trap") and ind.get("bull_trap_conf", 0) >= min_confidence:
-                # For bull traps: target = current price (exit NOW),
-                # re-entry SL shown so trader knows where to re-enter if wrong
-                _, re_entry_sl, _ = _calc_risk_params(
-                    cmp, atr, ind["resistance"], action="SELL"
-                )
-                bull_traps.append({
-                    "stock":              symbol,
-                    "sector":             sector,
-                    "cmp":                cmp,
-                    "rsi":                ind["rsi"],
-                    "confidence":         ind["bull_trap_conf"],
-                    "detail":             ind["bull_trap_detail"],
-                    "support":            ind["support"],
-                    "resistance":         ind["resistance"],
-                    "atr":                atr,
-                    "re_entry_sl":        re_entry_sl,
-                    "trend":              ind["trend"],
-                    "vol_ratio":          ind["vol_ratio"],
-                    "supertrend_bullish": ind.get("supertrend_bullish"),
-                    "patterns":           " | ".join(ind.get("patterns", []) + ind.get("candlesticks", [])),
-                })
-
-            # ── Bear Trap alert ───────────────────────────────────────────────────
-            if ind.get("bear_trap") and ind.get("bear_trap_conf", 0) >= min_confidence:
-                tgt, sl, rr = _calc_risk_params(
-                    cmp, atr, ind["resistance"], action="PICK"
-                )
-                bear_traps.append({
-                    "stock":              symbol,
-                    "sector":             sector,
-                    "cmp":                cmp,
-                    "rsi":                ind["rsi"],
-                    "confidence":         ind["bear_trap_conf"],
-                    "detail":             ind["bear_trap_detail"],
-                    "support":            ind["support"],
-                    "resistance":         ind["resistance"],
-                    "atr":                atr,
-                    "entry":              round(cmp, 2),
-                    "target":             tgt,
-                    "stop_loss":          sl,
-                    "risk_reward":        rr,
-                    "trend":              ind["trend"],
-                    "vol_ratio":          ind["vol_ratio"],
-                    "supertrend_bullish": ind.get("supertrend_bullish"),
-                    "patterns":           " | ".join(ind.get("patterns", []) + ind.get("candlesticks", [])),
-                })
-
-        except Exception:
-            continue
-
-    # Sort by confidence descending
-    bull_traps.sort(key=lambda x: x["confidence"], reverse=True)
-    bear_traps.sort(key=lambda x: x["confidence"], reverse=True)
-
-    return {
-        "bull_traps":  bull_traps,
-        "bear_traps":  bear_traps,
-        "scanned":     len(all_symbols),
-        "liquid":      liquid_count,
-        "bull_count":  len(bull_traps),
-        "bear_count":  len(bear_traps),
-        "timestamp":   datetime.now().strftime("%d %b %Y %H:%M"),
-    }
-
-
-# ==============================================================================
-# CORPORATE ACTIONS ENGINE
-# Fetches dividends, stock splits, and bonus issues for NSE stocks via yfinance.
-# Cached at module level with 6-hour TTL (actions don't change intraday).
-# ==============================================================================
-
-_CORP_CACHE    = {}
-_CORP_CACHE_TS = {}
-_CORP_TTL      = 21600   # 6 hours
-
-
-def fetch_corporate_actions(symbol):
-    """
-    Fetch recent + upcoming corporate actions for a single NSE stock.
-    Returns:
-        {
-          "symbol"         : str,
-          "dividends"      : list[{"date": str, "amount": float}],   # last 3
-          "splits"         : list[{"date": str, "ratio": float}],     # last 2
-          "upcoming_exdate": str | None,   # next ex-dividend date if known
-          "last_dividend"  : float | None, # most recent dividend amount
-          "last_div_date"  : str | None,
-          "has_split_1y"   : bool,         # any split/bonus in last 365 days
-        }
-    """
-    now = time.time()
-    clean = sanitize_ticker(symbol)
-    key   = f"corp_{clean}"
-
-    if key in _CORP_CACHE and (now - _CORP_CACHE_TS.get(key, 0)) < _CORP_TTL:
-        return _CORP_CACHE[key]
-
-    result = {
-        "symbol": clean, "dividends": [], "splits": [],
-        "upcoming_exdate": None, "last_dividend": None,
-        "last_div_date": None, "has_split_1y": False,
-    }
-    try:
-        t = yf.Ticker(_yahoo(clean))
-
-        # ── Dividends ────────────────────────────────────────────────────────
-        try:
-            divs = t.dividends
-            if divs is not None and not divs.empty:
-                recent = divs.tail(3)
-                result["dividends"] = [
-                    {"date": str(d.date()), "amount": round(float(v), 2)}
-                    for d, v in zip(recent.index, recent.values)
-                ]
-                result["last_dividend"] = round(float(divs.iloc[-1]), 2)
-                result["last_div_date"] = str(divs.index[-1].date())
-        except Exception:
-            pass
-
-        # ── Splits / Bonus ────────────────────────────────────────────────────
-        try:
-            splits = t.splits
-            if splits is not None and not splits.empty:
-                recent = splits.tail(3)
-                result["splits"] = [
-                    {"date": str(d.date()), "ratio": round(float(v), 4)}
-                    for d, v in zip(recent.index, recent.values)
-                ]
-                # Check if any split happened in the last 365 days
-                cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=365)
-                recent_splits = splits[splits.index >= cutoff]
-                result["has_split_1y"] = not recent_splits.empty
-        except Exception:
-            pass
-
-        # ── Upcoming ex-dividend date ─────────────────────────────────────────
-        try:
-            info = t.fast_info
-            # fast_info doesn't have ex-date; try calendar
-            cal = t.calendar
-            if isinstance(cal, dict):
-                exd = cal.get("Ex-Dividend Date") or cal.get("exDividendDate")
-                if exd:
-                    result["upcoming_exdate"] = str(pd.Timestamp(exd).date())
-            elif isinstance(cal, pd.DataFrame) and not cal.empty:
-                for col in ["Ex-Dividend Date", "exDividendDate"]:
-                    if col in cal.columns:
-                        val = cal[col].iloc[0]
-                        if pd.notna(val):
-                            result["upcoming_exdate"] = str(pd.Timestamp(val).date())
-                        break
-        except Exception:
-            pass
-
-    except Exception:
-        pass
-
-    _CORP_CACHE[key]    = result
-    _CORP_CACHE_TS[key] = now
-    return result
-
-
-def fetch_bulk_corporate_actions(symbols, max_workers=8):
-    """
-    Batch-fetch corporate actions for a list of NSE symbols using a thread pool.
-    Returns dict: {symbol: action_dict}
-    Gracefully skips failures — never raises.
-    """
-    results = {}
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_map = {
-            executor.submit(fetch_corporate_actions, sym): sym
-            for sym in symbols
-        }
-        for future in as_completed(future_map):
-            sym = future_map[future]
-            try:
-                results[sym] = future.result()
-            except Exception:
-                results[sym] = {
-                    "symbol": sym, "dividends": [], "splits": [],
-                    "upcoming_exdate": None, "last_dividend": None,
-                    "last_div_date": None, "has_split_1y": False,
-                }
-    return results
-
-
-def scan_corporate_actions_universe(min_dividend=0.0):
-    """
-    Sweep the full Nifty 500 for stocks with:
-      - Recent dividends (last 12 months)
-      - Upcoming ex-dividend dates
-      - Recent stock splits or bonus issues (last 365 days)
-
-    Returns:
-        {
-          "with_upcoming_exdate" : list[dict],  # stocks with known future ex-date
-          "recent_dividends"     : list[dict],  # paid dividend in last year
-          "recent_splits"        : list[dict],  # split/bonus in last 365 days
-          "timestamp"            : str,
-          "scanned"              : int,
-        }
-    """
-    all_symbols = get_scan_symbols()
-
-    actions_map = fetch_bulk_corporate_actions(all_symbols)
-
-    upcoming_exdate  = []
-    recent_dividends = []
-    recent_splits    = []
-    today_str        = str(datetime.now().date())
-
-    for sym, data in actions_map.items():
-        sector = get_sector(sym)
-        base   = {"stock": sym, "sector": sector}
-
-        # Upcoming ex-date (future dates only)
-        if data["upcoming_exdate"] and data["upcoming_exdate"] >= today_str:
-            upcoming_exdate.append({
-                **base,
-                "ex_date":       data["upcoming_exdate"],
-                "last_dividend": data["last_dividend"],
-                "last_div_date": data["last_div_date"],
-            })
-
-        # Recent dividend (within last 365 days)
-        if data["last_div_date"]:
-            cutoff = str((datetime.now() - pd.Timedelta(days=365)).date())
-            if data["last_div_date"] >= cutoff:
-                if data["last_dividend"] and data["last_dividend"] >= min_dividend:
-                    recent_dividends.append({
-                        **base,
-                        "amount":   data["last_dividend"],
-                        "ex_date":  data["last_div_date"],
-                    })
-
-        # Recent splits / bonus
-        if data["has_split_1y"] and data["splits"]:
-            latest_split = data["splits"][-1]
-            upcoming_exdate_val = data["upcoming_exdate"]
-            recent_splits.append({
-                **base,
-                "date":  latest_split["date"],
-                "ratio": latest_split["ratio"],
-                "type":  "Bonus" if latest_split["ratio"] > 1 else "Split",
-            })
-
-    # Sort
-    upcoming_exdate.sort(key=lambda x: x["ex_date"])
-    recent_dividends.sort(key=lambda x: x["amount"], reverse=True)
-    recent_splits.sort(key=lambda x: x["date"], reverse=True)
-
-    return {
-        "with_upcoming_exdate": upcoming_exdate,
-        "recent_dividends":     recent_dividends,
-        "recent_splits":        recent_splits,
-        "scanned":              len(all_symbols),
-        "timestamp":            datetime.now().strftime("%d %b %Y %H:%M"),
-    }
-
-
-# ==============================================================================
-# SMART MONEY CONCEPTS (SMC / ICT) MODULE
-# ==============================================================================
-# Five institutional-footprint detectors for NSE daily charts:
-#   1. detect_fvg()              — Fair Value Gaps (3-candle price inefficiency)
-#   2. detect_order_blocks()     — Bullish/Bearish institutional order blocks
-#   3. detect_liquidity_pools()  — Equal highs/lows (stop-loss clusters)
-#   4. premium_discount_zone()   — 50% range bias (premium=sell, discount=buy)
-#   5. detect_displacement()     — Strong momentum candles (institutional moves)
-#
-# NSE-SPECIFIC HANDLING:
-#   • Circuit filters: gaps caused by 5/10/20% circuit limits are flagged,
-#     not treated as genuine FVGs (they're forced moves, not inefficiencies).
-#   • ATR-relative thresholds: all "significance" gates scale with volatility
-#     so a small-cap and a large-cap are judged on the same relative basis.
-#   • Unmitigated tracking: FVGs/OBs are flagged as still-valid only if price
-#     hasn't already traded back through them.
-# ==============================================================================
-
-
-def detect_fvg(high, low, close, atr, lookback=30, max_zones=5):
-    """
-    Fair Value Gap: a 3-candle pattern where candle-1 and candle-3 do not
-    overlap, leaving a price 'gap' that tends to act as a magnet.
-
-      Bullish FVG: low[i+1] > high[i-1]   (gap below price, support zone)
-      Bearish FVG: high[i+1] < low[i-1]   (gap above price, resistance zone)
-
-    Returns dict:
-      bull_fvgs / bear_fvgs : list of {top, bottom, mid, idx, mitigated, size_atr}
-      nearest_bull_fvg      : closest unmitigated bullish FVG below price (or None)
-      nearest_bear_fvg      : closest unmitigated bearish FVG above price (or None)
-      in_bull_fvg / in_bear_fvg : bool — is current price inside an unfilled FVG
-    """
-    result = {
-        "bull_fvgs": [], "bear_fvgs": [],
-        "nearest_bull_fvg": None, "nearest_bear_fvg": None,
-        "in_bull_fvg": False, "in_bear_fvg": False,
-    }
-    n = len(close)
-    if n < 5:
-        return result
-
-    h = high.values; l = low.values; c = close.values
-    cmp = float(c[-1])
-    # Minimum gap size to count (filters noise): 0.25 ATR
-    min_gap = max(atr * 0.25, cmp * 0.001)
-    # Circuit-filter heuristic: a single-bar move > 4.5% on NSE is often a
-    # circuit-driven forced move, not a genuine inefficiency. Flag those.
-    start = max(2, n - lookback)
-
-    for i in range(start, n - 1):
-        # The gap-forming (middle) candle must itself be a real move, not drift.
-        # Require its close-to-close move >= 0.5 ATR, else it's not displacement.
-        mid_move = abs(c[i] - c[i - 1])
-        if mid_move < atr * 0.5:
-            continue
-        # Bullish FVG: gap between high[i-1] and low[i+1]
-        gap_bot = h[i - 1]
-        gap_top = l[i + 1]
-        if gap_top > gap_bot + min_gap:
-            size = gap_top - gap_bot
-            # circuit check: was the displacement candle (i) a huge single move?
-            cand_move = abs(c[i] - c[i - 1]) / max(c[i - 1], 1) * 100
-            is_circuit = cand_move > 4.5
-            # mitigated if price has since traded back below the gap top
-            mitigated = bool(np.any(l[i + 2:] <= gap_bot)) if i + 2 < n else False
-            result["bull_fvgs"].append({
-                "top": round(float(gap_top), 2), "bottom": round(float(gap_bot), 2),
-                "mid": round(float((gap_top + gap_bot) / 2), 2),
-                "idx": int(i), "mitigated": mitigated,
-                "size_atr": round(size / max(atr, 0.01), 2),
-                "circuit": is_circuit,
-            })
-        # Bearish FVG: gap between low[i-1] and high[i+1]
-        gap_top2 = l[i - 1]
-        gap_bot2 = h[i + 1]
-        if gap_bot2 < gap_top2 - min_gap:
-            size = gap_top2 - gap_bot2
-            cand_move = abs(c[i] - c[i - 1]) / max(c[i - 1], 1) * 100
-            is_circuit = cand_move > 4.5
-            mitigated = bool(np.any(h[i + 2:] >= gap_top2)) if i + 2 < n else False
-            result["bear_fvgs"].append({
-                "top": round(float(gap_top2), 2), "bottom": round(float(gap_bot2), 2),
-                "mid": round(float((gap_top2 + gap_bot2) / 2), 2),
-                "idx": int(i), "mitigated": mitigated,
-                "size_atr": round(size / max(atr, 0.01), 2),
-                "circuit": is_circuit,
-            })
-
-    # Trim to most recent max_zones each
-    result["bull_fvgs"] = result["bull_fvgs"][-max_zones:]
-    result["bear_fvgs"] = result["bear_fvgs"][-max_zones:]
-
-    # Nearest unmitigated, non-circuit zones
-    valid_bull = [f for f in result["bull_fvgs"]
-                  if not f["mitigated"] and not f["circuit"] and f["top"] < cmp]
-    valid_bear = [f for f in result["bear_fvgs"]
-                  if not f["mitigated"] and not f["circuit"] and f["bottom"] > cmp]
-    if valid_bull:
-        result["nearest_bull_fvg"] = max(valid_bull, key=lambda f: f["top"])
-    if valid_bear:
-        result["nearest_bear_fvg"] = min(valid_bear, key=lambda f: f["bottom"])
-
-    # Is price currently inside an unfilled FVG?
-    for f in result["bull_fvgs"]:
-        if not f["mitigated"] and f["bottom"] <= cmp <= f["top"]:
-            result["in_bull_fvg"] = True
-    for f in result["bear_fvgs"]:
-        if not f["mitigated"] and f["bottom"] <= cmp <= f["top"]:
-            result["in_bear_fvg"] = True
-
-    return result
-
-
-def detect_order_blocks(open_, high, low, close, atr, lookback=40, max_blocks=4):
-    """
-    Order Block: the last opposing candle before a strong displacement move.
-      Bullish OB: last DOWN candle before a strong UP move (institutional buying)
-      Bearish OB: last UP candle before a strong DOWN move (institutional selling)
-
-    A move qualifies as 'displacement' if it travels >= 1.5 ATR within 3 bars
-    of the order-block candle.
-
-    Returns dict:
-      bull_obs / bear_obs : list of {top, bottom, mid, idx, mitigated, strength_atr}
-      nearest_bull_ob     : closest unmitigated bullish OB below price (support)
-      nearest_bear_ob     : closest unmitigated bearish OB above price (resistance)
-      at_bull_ob / at_bear_ob : bool — price currently inside an OB zone
-    """
-    result = {
-        "bull_obs": [], "bear_obs": [],
-        "nearest_bull_ob": None, "nearest_bear_ob": None,
-        "at_bull_ob": False, "at_bear_ob": False,
-    }
-    n = len(close)
-    if n < 6:
-        return result
-
-    o = open_.values; h = high.values; l = low.values; c = close.values
-    cmp = float(c[-1])
-    disp_thresh = atr * 1.5
-    start = max(1, n - lookback)
-
-    for i in range(start, n - 3):
-        is_down = c[i] < o[i]
-        is_up   = c[i] > o[i]
-        # Look at the 3 bars following the candle for displacement
-        fwd_high = np.max(h[i + 1:i + 4])
-        fwd_low  = np.min(l[i + 1:i + 4])
-        # Impulsiveness: count directional closes in the 3 following bars.
-        # A real OB is followed by an IMPULSIVE leg, not choppy sideways drift.
-        fwd_up_closes   = int(np.sum(c[i + 1:i + 4] > o[i + 1:i + 4]))
-        fwd_down_closes = int(np.sum(c[i + 1:i + 4] < o[i + 1:i + 4]))
-
-        # Bullish OB: a down candle, then an IMPULSIVE up move >= 1.5 ATR
-        if (is_down and (fwd_high - h[i]) >= disp_thresh
-                and fwd_up_closes >= 2):
-            ob_top = max(o[i], c[i]); ob_bot = l[i]
-            mitigated = bool(np.any(l[i + 4:] <= ob_bot)) if i + 4 < n else False
-            result["bull_obs"].append({
-                "top": round(float(ob_top), 2), "bottom": round(float(ob_bot), 2),
-                "mid": round(float((ob_top + ob_bot) / 2), 2),
-                "idx": int(i), "mitigated": mitigated,
-                "strength_atr": round((fwd_high - h[i]) / max(atr, 0.01), 2),
-            })
-        # Bearish OB: an up candle, then an IMPULSIVE down move >= 1.5 ATR
-        if (is_up and (l[i] - fwd_low) >= disp_thresh
-                and fwd_down_closes >= 2):
-            ob_top = h[i]; ob_bot = min(o[i], c[i])
-            mitigated = bool(np.any(h[i + 4:] >= ob_top)) if i + 4 < n else False
-            result["bear_obs"].append({
-                "top": round(float(ob_top), 2), "bottom": round(float(ob_bot), 2),
-                "mid": round(float((ob_top + ob_bot) / 2), 2),
-                "idx": int(i), "mitigated": mitigated,
-                "strength_atr": round((l[i] - fwd_low) / max(atr, 0.01), 2),
-            })
-
-    result["bull_obs"] = result["bull_obs"][-max_blocks:]
-    result["bear_obs"] = result["bear_obs"][-max_blocks:]
-
-    valid_bull = [b for b in result["bull_obs"]
-                  if not b["mitigated"] and b["top"] < cmp]
-    valid_bear = [b for b in result["bear_obs"]
-                  if not b["mitigated"] and b["bottom"] > cmp]
-    if valid_bull:
-        result["nearest_bull_ob"] = max(valid_bull, key=lambda b: b["top"])
-    if valid_bear:
-        result["nearest_bear_ob"] = min(valid_bear, key=lambda b: b["bottom"])
-
-    for b in result["bull_obs"]:
-        if not b["mitigated"] and b["bottom"] <= cmp <= b["top"]:
-            result["at_bull_ob"] = True
-    for b in result["bear_obs"]:
-        if not b["mitigated"] and b["bottom"] <= cmp <= b["top"]:
-            result["at_bear_ob"] = True
-
-    return result
-
-
-def detect_liquidity_pools(high, low, close, atr, lookback=50, tol_atr=0.15):
-    """
-    Liquidity Pool: clusters of near-equal highs (buy-side liquidity, where
-    stops of short-sellers sit) or near-equal lows (sell-side liquidity, where
-    stops of long-holders sit). Smart money targets these stop clusters.
-
-    Two swing points are 'equal' if within tol_atr * ATR of each other.
-
-    Returns dict:
-      buyside_liquidity  : list of price levels (equal highs) above interest
-      sellside_liquidity : list of price levels (equal lows)
-      nearest_buyside     : closest equal-high cluster above price (or None)
-      nearest_sellside    : closest equal-low cluster below price (or None)
-    """
-    result = {
-        "buyside_liquidity": [], "sellside_liquidity": [],
-        "nearest_buyside": None, "nearest_sellside": None,
-    }
-    n = len(close)
-    if n < 10:
-        return result
-
-    h = high.values; l = low.values
-    cmp = float(close.values[-1])
-    tol = atr * tol_atr
-    start = max(2, n - lookback)
-
-    # Find local swing highs/lows with PROMINENCE filter.
-    # A swing must stand out from its neighbours by >= 0.4 ATR to count —
-    # this skips micro-swings/noise that aren't real liquidity-resting points.
-    prom = atr * 0.4
-    swing_highs = []
-    swing_lows  = []
-    for i in range(start, n - 1):
-        # 3-bar fractal high that is meaningfully above both neighbours
-        if (h[i] >= h[i - 1] and h[i] >= h[i + 1]
-                and (h[i] - min(h[i - 1], h[i + 1])) >= prom):
-            swing_highs.append((i, h[i]))
-        # 3-bar fractal low that is meaningfully below both neighbours
-        if (l[i] <= l[i - 1] and l[i] <= l[i + 1]
-                and (max(l[i - 1], l[i + 1]) - l[i]) >= prom):
-            swing_lows.append((i, l[i]))
-
-    # Cluster equal highs (buy-side liquidity)
-    used = set()
-    for idx_a, (ia, pa) in enumerate(swing_highs):
-        if ia in used:
-            continue
-        cluster = [pa]
-        for ib, pb in swing_highs[idx_a + 1:]:
-            if abs(pb - pa) <= tol:
-                cluster.append(pb); used.add(ib)
-        if len(cluster) >= 2:  # need >=2 equal highs to be a pool
-            level = round(float(np.mean(cluster)), 2)
-            result["buyside_liquidity"].append({"level": level, "touches": len(cluster)})
-
-    # Cluster equal lows (sell-side liquidity)
-    used = set()
-    for idx_a, (ia, pa) in enumerate(swing_lows):
-        if ia in used:
-            continue
-        cluster = [pa]
-        for ib, pb in swing_lows[idx_a + 1:]:
-            if abs(pb - pa) <= tol:
-                cluster.append(pb); used.add(ib)
-        if len(cluster) >= 2:
-            level = round(float(np.mean(cluster)), 2)
-            result["sellside_liquidity"].append({"level": level, "touches": len(cluster)})
-
-    # Nearest pools relative to current price
-    above = [p for p in result["buyside_liquidity"] if p["level"] > cmp]
-    below = [p for p in result["sellside_liquidity"] if p["level"] < cmp]
-    if above:
-        result["nearest_buyside"] = min(above, key=lambda p: p["level"] - cmp)
-    if below:
-        result["nearest_sellside"] = min(below, key=lambda p: cmp - p["level"])
-
-    return result
-
-
-def premium_discount_zone(high, low, close, lookback=40):
-    """
-    Premium/Discount: divides the recent dealing range by its 50% midpoint.
-      Price in PREMIUM (upper 50%)  → favour selling / caution on longs
-      Price in DISCOUNT (lower 50%) → favour buying
-      Equilibrium (~50%)            → neutral
-
-    Returns dict:
-      zone        : 'Premium' | 'Discount' | 'Equilibrium'
-      range_high / range_low / equilibrium : float
-      pct_in_range: where price sits, 0 (low) to 100 (high)
-      bias        : 'Bullish' | 'Bearish' | 'Neutral'
-    """
-    result = {
-        "zone": "Unknown", "range_high": None, "range_low": None,
-        "equilibrium": None, "pct_in_range": None, "bias": "Neutral",
-    }
-    n = len(close)
-    if n < 5:
-        return result
-
-    window = min(lookback, n)
-    rng_high = float(high.values[-window:].max())
-    rng_low  = float(low.values[-window:].min())
-    cmp = float(close.values[-1])
-    if rng_high <= rng_low:
-        return result
-
-    eq = (rng_high + rng_low) / 2
-    pct = (cmp - rng_low) / (rng_high - rng_low) * 100
-
-    if pct >= 60:
-        zone, bias = "Premium", "Bearish"
-    elif pct <= 40:
-        zone, bias = "Discount", "Bullish"
-    else:
-        zone, bias = "Equilibrium", "Neutral"
-
-    result.update({
-        "zone": zone, "range_high": round(rng_high, 2), "range_low": round(rng_low, 2),
-        "equilibrium": round(eq, 2), "pct_in_range": round(pct, 1), "bias": bias,
-    })
-    return result
-
-
-def detect_displacement(open_, high, low, close, atr, lookback=10):
-    """
-    Displacement: a strong, large-bodied candle signalling institutional
-    intent. Defined as a candle whose body >= 1.5 ATR with a close in the
-    top/bottom third of its range (conviction close).
-
-    Returns dict:
-      recent_displacement : bool — any displacement in the lookback window
-      direction           : 'Bullish' | 'Bearish' | None (most recent)
-      bars_ago            : how many bars since the last displacement
-      strength_atr        : body size of the last displacement in ATR
-    """
-    result = {
-        "recent_displacement": False, "direction": None,
-        "bars_ago": None, "strength_atr": None,
-    }
-    n = len(close)
-    if n < 3:
-        return result
-
-    o = open_.values; h = high.values; l = low.values; c = close.values
-    start = max(0, n - lookback)
-    for i in range(n - 1, start - 1, -1):
-        body = abs(c[i] - o[i])
-        rng  = max(h[i] - l[i], 1e-9)
-        # Single-candle displacement: body >= 1.5 ATR with conviction close
-        if body >= atr * 1.5:
-            close_pos = (c[i] - l[i]) / rng
-            if c[i] > o[i] and close_pos >= 0.66:
-                result.update({"recent_displacement": True, "direction": "Bullish",
-                               "bars_ago": int(n - 1 - i),
-                               "strength_atr": round(body / max(atr, 0.01), 2)})
-                return result
-            if c[i] < o[i] and close_pos <= 0.34:
-                result.update({"recent_displacement": True, "direction": "Bearish",
-                               "bars_ago": int(n - 1 - i),
-                               "strength_atr": round(body / max(atr, 0.01), 2)})
-                return result
-        # Multi-candle leg: 2-3 consecutive same-direction candles covering
-        # >= 2 ATR total also counts as institutional displacement.
-        if i >= 2:
-            up3   = all(c[j] > o[j] for j in (i-2, i-1, i))
-            dn3   = all(c[j] < o[j] for j in (i-2, i-1, i))
-            leg   = abs(c[i] - o[i-2])
-            if (up3 or dn3) and leg >= atr * 2.0:
-                result.update({
-                    "recent_displacement": True,
-                    "direction": "Bullish" if up3 else "Bearish",
-                    "bars_ago": int(n - 1 - i),
-                    "strength_atr": round(leg / max(atr, 0.01), 2)})
-                return result
-    return result
-
-
-def build_smc_setup(cmp, atr, fvg, obs, liq, pdz, disp, score):
-    """
-    Converts raw SMC structure into a single actionable trade setup with
-    concrete Entry, Target, and Stop-Loss — all derived from real structural
-    levels, not arbitrary ATR multiples.
-
-    LOGIC
-    ─────────────────────────────────────────────────────────────────────────
-    BUY setup (needs bullish confluence):
-      • Trigger: price in/near a bull Order Block OR bull FVG, in Discount or
-        Equilibrium, ideally with recent bullish displacement.
-      • Entry : top of the bull OB (or FVG mid) — where demand sits.
-      • SL    : just below the OB/FVG bottom (structure invalidation).
-      • Target: nearest buy-side liquidity above (equal highs = stop cluster
-        price is drawn toward); fallback to range high / 2R.
-
-    SELL setup (mirror, bearish confluence):
-      • Entry : bottom of bear OB (or FVG mid).
-      • SL    : just above the OB/FVG top.
-      • Target: nearest sell-side liquidity below; fallback range low / 2R.
-
-    Returns dict:
-      smc_action      : 'BUY' | 'SELL' | 'WAIT'
-      smc_entry/target/sl : float | None
-      smc_rr          : float | None  (reward:risk)
-      smc_setup_quality : 'A+' | 'A' | 'B' | None  (confluence grade)
-      smc_setup_reason  : str  (human explanation)
-    ─────────────────────────────────────────────────────────────────────────
-    """
-    out = {
-        "smc_action": "WAIT", "smc_entry": None, "smc_target": None,
-        "smc_sl": None, "smc_rr": None, "smc_setup_quality": None,
-        "smc_setup_reason": "No high-confluence SMC setup right now.",
-    }
-
-    sl_buffer = max(atr * 0.25, cmp * 0.002)   # small buffer beyond structure
-
-    # ── BUY SETUP ──────────────────────────────────────────────────────────────
-    bull_zone = obs.get("nearest_bull_ob") or (
-        {"top": obs["at_bull_ob"]} if False else None)
-    # Prefer an OB the price is AT or just above; else nearest bull FVG
-    buy_zone = None; buy_src = None
-    if obs.get("at_bull_ob") and obs.get("nearest_bull_ob"):
-        buy_zone = obs["nearest_bull_ob"]; buy_src = "Order Block"
-    elif obs.get("nearest_bull_ob"):
-        buy_zone = obs["nearest_bull_ob"]; buy_src = "Order Block"
-    elif fvg.get("in_bull_fvg") and fvg.get("nearest_bull_fvg"):
-        buy_zone = fvg["nearest_bull_fvg"]; buy_src = "Fair Value Gap"
-    elif fvg.get("nearest_bull_fvg"):
-        buy_zone = fvg["nearest_bull_fvg"]; buy_src = "Fair Value Gap"
-
-    # ── SELL SETUP ─────────────────────────────────────────────────────────────
-    sell_zone = None; sell_src = None
-    if obs.get("at_bear_ob") and obs.get("nearest_bear_ob"):
-        sell_zone = obs["nearest_bear_ob"]; sell_src = "Order Block"
-    elif obs.get("nearest_bear_ob"):
-        sell_zone = obs["nearest_bear_ob"]; sell_src = "Order Block"
-    elif fvg.get("in_bear_fvg") and fvg.get("nearest_bear_fvg"):
-        sell_zone = fvg["nearest_bear_fvg"]; sell_src = "Fair Value Gap"
-    elif fvg.get("nearest_bear_fvg"):
-        sell_zone = fvg["nearest_bear_fvg"]; sell_src = "Fair Value Gap"
-
-    zone_pct = pdz.get("pct_in_range")
-    disp_dir = disp.get("direction")
-    disp_recent = disp.get("bars_ago") is not None and disp.get("bars_ago") <= 4
-
-    # Proximity gate: only emit a setup if CMP is within a workable distance of
-    # the entry zone (<= 4 ATR away). Prevents suggesting an entry far from the
-    # current price, which is the #1 source of confusing/unusable signals.
-    max_dist = atr * 4.0
-    def _zone_near(zone):
-        if not zone:
-            return False
-        z_top = float(zone.get("top", 0)); z_bot = float(zone.get("bottom", 0))
-        z_mid = (z_top + z_bot) / 2
-        return abs(cmp - z_mid) <= max_dist
-
-    buy_near  = _zone_near(buy_zone)
-    sell_near = _zone_near(sell_zone)
-
-    # ── Decide direction by confluence score + zone availability + proximity ───
-    want_buy  = score >= 25 and buy_zone is not None and buy_near
-    want_sell = score <= -25 and sell_zone is not None and sell_near
-
-    # If both or neither, pick the stronger-aligned one
-    if want_buy and not want_sell:
-        decision = "BUY"
-    elif want_sell and not want_buy:
-        decision = "SELL"
-    elif want_buy and want_sell:
-        decision = "BUY" if score > 0 else "SELL"
-    else:
-        decision = "WAIT"
-
-    # ── Build BUY ──────────────────────────────────────────────────────────────
-    if decision == "BUY" and buy_zone:
-        entry = float(buy_zone["top"])           # enter at demand top
-        zbot  = float(buy_zone["bottom"])
-        sl    = round(zbot - sl_buffer, 2)
-        # Target = nearest buy-side liquidity above, else range high, else 2R
-        tgt = None
-        nbs = liq.get("nearest_buyside")
-        if nbs and nbs["level"] > entry:
-            tgt = float(nbs["level"])
-        elif pdz.get("range_high") and pdz["range_high"] > entry:
-            tgt = float(pdz["range_high"])
-        risk = max(entry - sl, 0.01)
-        if tgt is None or tgt <= entry:
-            tgt = round(entry + risk * 2, 2)     # fallback 2R
-        rr = round((tgt - entry) / risk, 2)
-
-        # Quality grade by confluence (+ RR magnitude bonus)
-        confl = 0
-        if pdz.get("bias") == "Bullish": confl += 1
-        if buy_src == "Order Block":     confl += 1
-        if disp_dir == "Bullish" and disp_recent: confl += 1
-        if nbs:                          confl += 1
-        if rr >= 3.0:                    confl += 1   # strong RR adds conviction
-        quality = "A+" if confl >= 4 else "A" if confl == 3 else "B"
-
-        reasons = [f"Buy at {buy_src} ${entry}"]
-        if zone_pct is not None: reasons.append(f"{pdz.get('zone')} zone ({zone_pct}%)")
-        if disp_dir == "Bullish" and disp_recent: reasons.append("bullish displacement")
-        if nbs: reasons.append(f"target buy-side liq ${tgt}")
-
-        # Only surface if RR is worthwhile
-        if rr >= 1.3:
-            out.update({
-                "smc_action": "BUY", "smc_entry": round(entry, 2),
-                "smc_target": round(tgt, 2), "smc_sl": sl, "smc_rr": rr,
-                "smc_setup_quality": quality,
-                "smc_setup_reason": " · ".join(reasons),
-            })
-
-    # ── Build SELL ─────────────────────────────────────────────────────────────
-    elif decision == "SELL" and sell_zone:
-        entry = float(sell_zone["bottom"])       # enter at supply bottom
-        ztop  = float(sell_zone["top"])
-        sl    = round(ztop + sl_buffer, 2)
-        tgt = None
-        nss = liq.get("nearest_sellside")
-        if nss and nss["level"] < entry:
-            tgt = float(nss["level"])
-        elif pdz.get("range_low") and pdz["range_low"] < entry:
-            tgt = float(pdz["range_low"])
-        risk = max(sl - entry, 0.01)
-        if tgt is None or tgt >= entry:
-            tgt = round(entry - risk * 2, 2)
-        rr = round((entry - tgt) / risk, 2)
-
-        confl = 0
-        if pdz.get("bias") == "Bearish": confl += 1
-        if sell_src == "Order Block":    confl += 1
-        if disp_dir == "Bearish" and disp_recent: confl += 1
-        if nss:                          confl += 1
-        if rr >= 3.0:                    confl += 1
-        quality = "A+" if confl >= 4 else "A" if confl == 3 else "B"
-
-        reasons = [f"Sell at {sell_src} ${entry}"]
-        if zone_pct is not None: reasons.append(f"{pdz.get('zone')} zone ({zone_pct}%)")
-        if disp_dir == "Bearish" and disp_recent: reasons.append("bearish displacement")
-        if nss: reasons.append(f"target sell-side liq ${tgt}")
-
-        if rr >= 1.3:
-            out.update({
-                "smc_action": "SELL", "smc_entry": round(entry, 2),
-                "smc_target": round(tgt, 2), "smc_sl": sl, "smc_rr": rr,
-                "smc_setup_quality": quality,
-                "smc_setup_reason": " · ".join(reasons),
-            })
-
-    return out
-
-
-def compute_smc(open_, high, low, close, vol, atr):
-    """
-    Master SMC aggregator — runs all five detectors and returns a flat dict
-    of the most actionable signals plus a combined SMC bias score.
-
-    smc_bias: -100 (strong bearish confluence) to +100 (strong bullish).
-    """
-    fvg  = detect_fvg(high, low, close, atr)
-    obs  = detect_order_blocks(open_, high, low, close, atr)
-    liq  = detect_liquidity_pools(high, low, close, atr)
-    pdz  = premium_discount_zone(high, low, close)
-    disp = detect_displacement(open_, high, low, close, atr)
-
-    # Combined bias score from confluence
-    score = 0
-    if pdz["bias"] == "Bullish": score += 20
-    elif pdz["bias"] == "Bearish": score -= 20
-    if fvg["in_bull_fvg"]: score += 15
-    if fvg["in_bear_fvg"]: score -= 15
-    if obs["at_bull_ob"]: score += 20
-    if obs["at_bear_ob"]: score -= 20
-    if disp["direction"] == "Bullish" and disp["bars_ago"] is not None and disp["bars_ago"] <= 3:
-        score += 15
-    elif disp["direction"] == "Bearish" and disp["bars_ago"] is not None and disp["bars_ago"] <= 3:
-        score -= 15
-    # Nearest unfilled FVG acting as a pull — but DON'T double-count if price
-    # is already inside an FVG (that's already scored above).
-    if fvg["nearest_bull_fvg"] and not fvg["in_bull_fvg"]: score += 8
-    if fvg["nearest_bear_fvg"] and not fvg["in_bear_fvg"]: score -= 8
-    score = max(-100, min(100, score))
-
-    if score >= 35:   smc_label = "Bullish SMC"
-    elif score <= -35: smc_label = "Bearish SMC"
-    else:             smc_label = "Neutral SMC"
-
-    # Build the actionable trade setup from the structure
-    cmp = float(close.iloc[-1]) if len(close) else 0.0
-    setup = build_smc_setup(cmp, atr, fvg, obs, liq, pdz, disp, score)
-
-    return {
-        # Premium/Discount
-        "smc_zone": pdz["zone"], "smc_zone_pct": pdz["pct_in_range"],
-        "smc_bias": pdz["bias"], "smc_equilibrium": pdz["equilibrium"],
-        "smc_range_high": pdz["range_high"], "smc_range_low": pdz["range_low"],
-        # FVG
-        "smc_in_bull_fvg": fvg["in_bull_fvg"], "smc_in_bear_fvg": fvg["in_bear_fvg"],
-        "smc_nearest_bull_fvg": fvg["nearest_bull_fvg"],
-        "smc_nearest_bear_fvg": fvg["nearest_bear_fvg"],
-        "smc_bull_fvg_count": len([f for f in fvg["bull_fvgs"] if not f["mitigated"]]),
-        "smc_bear_fvg_count": len([f for f in fvg["bear_fvgs"] if not f["mitigated"]]),
-        # Order Blocks
-        "smc_at_bull_ob": obs["at_bull_ob"], "smc_at_bear_ob": obs["at_bear_ob"],
-        "smc_nearest_bull_ob": obs["nearest_bull_ob"],
-        "smc_nearest_bear_ob": obs["nearest_bear_ob"],
-        # Liquidity
-        "smc_nearest_buyside": liq["nearest_buyside"],
-        "smc_nearest_sellside": liq["nearest_sellside"],
-        # Displacement
-        "smc_displacement": disp["direction"],
-        "smc_displacement_bars_ago": disp["bars_ago"],
-        # Combined
-        "smc_score": score, "smc_label": smc_label,
-        # Actionable trade setup
-        "smc_action": setup["smc_action"],
-        "smc_entry": setup["smc_entry"],
-        "smc_target": setup["smc_target"],
-        "smc_sl": setup["smc_sl"],
-        "smc_rr": setup["smc_rr"],
-        "smc_setup_quality": setup["smc_setup_quality"],
-        "smc_setup_reason": setup["smc_setup_reason"],
-    }
-
-
-# ==============================================================================
-# SMC SETUP SCANNER — sweeps universe for actionable SMC trade setups
-# ==============================================================================
-def scan_for_smc_setups(min_quality="B", action_filter="All"):
-    """
-    Sweeps the full universe for stocks with an actionable SMC trade setup
-    (BUY or SELL) with concrete Entry/Target/SL/RR.
-
-    Args:
-        min_quality   : 'A+', 'A', or 'B' — minimum setup grade to include
-        action_filter : 'All', 'BUY', or 'SELL'
-
-    Returns:
-        {
-          "buy_setups"  : list[dict] sorted by quality then RR,
-          "sell_setups" : list[dict],
-          "scanned": int, "liquid": int,
-          "buy_count": int, "sell_count": int,
-          "timestamp": str,
-        }
-    Each setup: stock, sector, cmp, action, entry, target, stop_loss,
-                risk_reward, quality, reason, smc_score, zone
-    """
-    quality_rank = {"A+": 3, "A": 2, "B": 1}
-    min_rank = quality_rank.get(min_quality, 1)
-
-    all_symbols = get_scan_symbols()
-
-    bulk = _bulk_fetch_history(all_symbols, period="6mo")
-
-    buy_setups, sell_setups = [], []
-    liquid = 0
-
-    for symbol in all_symbols:
-        df  = bulk.get(symbol)
-        ind = compute_indicators(symbol, period="6mo", prefetched_df=df)
-        if not ind:
-            continue
-        if not ind.get("liquidity_ok", True):
-            continue
-        liquid += 1
-
-        action  = ind.get("smc_action", "WAIT")
-        quality = ind.get("smc_setup_quality")
-        if action == "WAIT" or not quality:
-            continue
-        if quality_rank.get(quality, 0) < min_rank:
-            continue
-        if action_filter != "All" and action != action_filter:
-            continue
-
-        entry = {
-            "stock": symbol, "sector": get_sector(symbol),
-            "cmp": ind.get("cmp"), "action": action,
-            "entry": ind.get("smc_entry"), "target": ind.get("smc_target"),
-            "stop_loss": ind.get("smc_sl"), "risk_reward": ind.get("smc_rr"),
-            "quality": quality, "reason": ind.get("smc_setup_reason", ""),
-            "smc_score": ind.get("smc_score", 0), "zone": ind.get("smc_zone", ""),
-        }
-        if action == "BUY":
-            buy_setups.append(entry)
+                        st.error("❌ Broadcast failed. Check token/chat ID.")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown('<div class="sec">🌍 Live Portfolio News</div>',
+                unsafe_allow_html=True)
+
+    with st.expander("📰 Latest Headlines for Active Holdings", expanded=False):
+        open_raw = raw[raw["status"] == "Open"] if not raw.empty else pd.DataFrame()
+        if not open_raw.empty:
+            col_news1, col_news2 = st.columns([3, 1])
+            with col_news2:
+                force_news = st.button("🔄 Refresh News", width="stretch")
+            if force_news:
+                with st.spinner("Fetching latest headlines..."):
+                    st.session_state.news_cache = fetch_portfolio_news(open_raw)
+
+            render_news(st.session_state.news_cache or [])
         else:
-            sell_setups.append(entry)
+            st.info("No active trades. Add a trade to see related news.")
 
-    def _sort_key(s):
-        return (quality_rank.get(s["quality"], 0), s.get("risk_reward") or 0)
-    buy_setups.sort(key=_sort_key, reverse=True)
-    sell_setups.sort(key=_sort_key, reverse=True)
+    if st.session_state.signals_cache is not None:
+        nc = {"SELL": 0, "AVERAGE": 0, "HOLD": 0, "WATCH": 0}
+        for s in st.session_state.signals_cache:
+            for k in nc:
+                if k in s.get("action", ""):
+                    nc[k] += 1
 
-    return {
-        "buy_setups": buy_setups, "sell_setups": sell_setups,
-        "scanned": len(all_symbols), "liquid": liquid,
-        "buy_count": len(buy_setups), "sell_count": len(sell_setups),
-        "timestamp": datetime.now().strftime("%d %b %Y %H:%M"),
-    }
+        st.markdown(
+            f'<div style="display:flex;gap:.8rem;margin:.5rem 0 1rem">'
+            f'<span style="background:rgba(239,68,68,.15);color:#ef4444;'
+            f'padding:.3rem .8rem;border-radius:6px;font-size:.8rem;font-weight:800;'
+            f'border:1px solid rgba(239,68,68,.3)">🔴 SELL: {nc["SELL"]}</span>'
+            f'<span style="background:rgba(245,158,11,.15);color:#f59e0b;'
+            f'padding:.3rem .8rem;border-radius:6px;font-size:.8rem;font-weight:800;'
+            f'border:1px solid rgba(245,158,11,.3)">🟡 AVERAGE: {nc["AVERAGE"]}</span>'
+            f'<span style="background:rgba(16,185,129,.15);color:#10b981;'
+            f'padding:.3rem .8rem;border-radius:6px;font-size:.8rem;font-weight:800;'
+            f'border:1px solid rgba(16,185,129,.3)">🟢 HOLD: {nc["HOLD"]}</span>'
+            f'<span style="background:rgba(148,163,184,.1);color:#94a3b8;'
+            f'padding:.3rem .8rem;border-radius:6px;font-size:.8rem;font-weight:800;'
+            f'border:1px solid rgba(148,163,184,.3)">⚪ WATCH: {nc["WATCH"]}</span>'
+            f'</div>',
+            unsafe_allow_html=True)
 
-def scan_for_vcp(min_quality="B", ready_only=False):
-    """
-    Sweeps the universe for stocks forming a Volatility Contraction Pattern.
+        render_signals(st.session_state.signals_cache, theme_t)
 
-    Args:
-        min_quality : 'A+', 'A', 'B', or 'C' — minimum base grade to include
-        ready_only  : if True, only return pivot-ready bases (coiled at breakout)
+# ── Sector Rotation ──────────────────────────────────────────────────────────
+elif _page == 'sector':
+    st.markdown('<div class="sec">Macro Sector Rotation & Capital Flow</div>',
+                unsafe_allow_html=True)
 
-    Returns:
-        {
-          "vcp_setups": list[dict] sorted by quality then pivot proximity,
-          "scanned": int, "liquid": int, "count": int, "ready_count": int,
-          "timestamp": str,
-        }
-    Each setup: stock, sector, cmp, pivot, pivot_distance_pct, quality,
-                contractions, vcp_ready, detail, entry, target, stop_loss
-    """
-    quality_rank = {"A+": 4, "A": 3, "B": 2, "C": 1}
-    min_rank = quality_rank.get(min_quality, 2)
+    if st.session_state.sector_cache is not None:
+        render_sector(st.session_state.sector_cache, theme_t)
 
-    all_symbols = get_scan_symbols()
+        if not st.session_state.sector_cache.empty:
+            top = st.session_state.sector_cache.iloc[0]
+            rs_val  = top.get("rs_vs_nifty_1m", 0) or 0
+            rs_clr  = "#10b981" if rs_val > 0 else "#ef4444"
+            rrg_val = top.get("rrg_quadrant", "—")
 
-    bulk = _bulk_fetch_history(all_symbols, period="6mo")
+            st.markdown(
+                f'<div style="margin-top:1rem;background:rgba(16,185,129,.08);'
+                f'border:1px solid rgba(16,185,129,.3);border-radius:8px;'
+                f'padding:.8rem 1rem;font-size:.85rem">'
+                f'🥇 <b style="color:var(--text)">Leading Sector: {top["sector"]}</b>'
+                f' — Momentum {top["momentum_score"]:.2f}'
+                f' | Avg RSI {top["avg_rsi"]:.0f}'
+                f' | Flow {top["avg_pct"]:+.1f}%'
+                f' | RS vs S&P <b style="color:{rs_clr}">{rs_val:+.1f}%</b>'
+                f' | {rrg_val}<br>'
+                f'<span style="color:var(--muted);font-size:.75rem;margin-top:5px;'
+                f'display:block">Constituents: {top["stocks"]}</span>'
+                f'</div>',
+                unsafe_allow_html=True)
 
-    vcp_setups = []
-    liquid = 0
-    ready_count = 0
+    if (st.session_state.outlook_cache is not None and
+            not st.session_state.outlook_cache.empty):
+        st.markdown(
+            '<div class="sec" style="margin-top:2rem">📈 Institutional Outlook</div>',
+            unsafe_allow_html=True)
+        render_outlook(st.session_state.outlook_cache, theme_t)
 
-    for symbol in all_symbols:
-        df  = bulk.get(symbol)
-        ind = compute_indicators(symbol, period="6mo", prefetched_df=df)
-        if not ind:
-            continue
-        if not ind.get("liquidity_ok", True):
-            continue
-        liquid += 1
+    if st.session_state.picks_cache is not None:
+        st.markdown(
+            '<div class="sec" style="margin-top:2rem">🎯 Algorithmic Entry Setups</div>',
+            unsafe_allow_html=True)
+        render_picks(st.session_state.picks_cache, theme_t)
 
-        if not ind.get("vcp"):
-            continue
-        quality = ind.get("vcp_quality")
-        if quality_rank.get(quality, 0) < min_rank:
-            continue
-        is_ready = ind.get("vcp_ready", False)
-        if ready_only and not is_ready:
-            continue
-        if is_ready:
-            ready_count += 1
+# ── Universe Scanner ─────────────────────────────────────────────────────────
+elif _page == 'scanner':
+    st.markdown(
+        f'<div class="sec">🌌 Universe Scanner — top {min(MAX_SCAN_SYMBOLS, UNIVERSE_TOTAL):,} liquid of {UNIVERSE_TOTAL:,}</div>',
+        unsafe_allow_html=True)
 
-        cmp   = ind.get("cmp")
-        pivot = ind.get("vcp_pivot")
-        atr   = ind.get("atr", 0)
-        # Entry just above pivot; stop below last contraction low (~1.5 ATR);
-        # target a measured move (pivot + the first/biggest contraction depth).
-        entry = round(pivot * 1.002, 2) if pivot else cmp
-        stop  = round(entry - 1.5 * atr, 2) if atr else (round(entry * 0.93, 2) if entry else None)
-        contractions = ind.get("vcp_contractions", [])
-        move_pct = (max(contractions) / 100.0) if contractions else 0.10
-        target = round(entry * (1 + max(move_pct, 0.08)), 2) if entry else None
-        rr = round((target - entry) / (entry - stop), 2) if (entry and stop and entry > stop) else None
+    # ── Universe source breakdown ─────────────────────────────────────────────
+    src_html = ""
+    for lbl, n, sk, err in UNIVERSE_SOURCES:
+        clr = theme_t["green"] if n > 0 else theme_t["red"]
+        src_html += (
+            f'<span style="background:var(--card2);border:1px solid var(--border);'
+            f'border-radius:6px;padding:.25rem .6rem;font-size:.72rem;'
+            f'font-weight:700;color:var(--text)">'
+            f'{"📄" if n > 0 else "❌"} {lbl} '
+            f'<span style="color:{clr}">{n:,}</span></span> '
+        )
+    st.markdown(
+        f'<div style="display:flex;gap:.4rem;flex-wrap:wrap;margin-bottom:.8rem;'
+        f'align-items:center">'
+        f'<span style="font-size:.75rem;color:var(--muted);font-weight:600">'
+        f'Sources loaded:</span> {src_html}</div>',
+        unsafe_allow_html=True)
 
-        vcp_setups.append({
-            "stock": symbol, "sector": get_sector(symbol), "cmp": cmp,
-            "pivot": pivot, "pivot_distance_pct": ind.get("vcp_pivot_dist"),
-            "quality": quality, "contractions": contractions,
-            "vcp_ready": is_ready, "detail": ind.get("vcp_detail", ""),
-            "entry": entry, "target": target, "stop_loss": stop, "risk_reward": rr,
-        })
+    # ── Diagnostic expander — shows exactly what loaded and why ───────────────
+    with st.expander("🔍 Universe Load Diagnostics", expanded=False):
+        st.code(debug_universe_load(), language=None)
+        st.caption("If a file shows '❌ not found', check it is committed to "
+                   "your repo root (same folder as signals.py and app.py).")
 
-    def _sort_key(s):
-        # ready first, then quality, then closest to pivot
-        return (1 if s["vcp_ready"] else 0,
-                quality_rank.get(s["quality"], 0),
-                -(s.get("pivot_distance_pct") or 999))
-    vcp_setups.sort(key=_sort_key, reverse=True)
+    st.markdown(
+        f'<div style="background:rgba(212,175,55,.06);border:1px solid rgba(212,175,55,.2);'
+        f'border-radius:8px;padding:.7rem 1rem;font-size:.8rem;color:var(--muted);'
+        f'margin-bottom:1rem;line-height:1.6">'
+        f'💡 <b style="color:var(--text)">Universe:</b> Edit '
+        f'<code>us_universe.csv</code> (Symbol,Name,Sector) and commit to your repo root.<br>'
+        f'Run <code>python build_us_universe.py</code> to refresh the liquid-filtered '
+        f'<code>us_universe_liquid.csv</code> (price + average dollar-volume screen). '
+        f'ETFs live in <code>us_etfs.csv</code>.'
+        f'</div>',
+        unsafe_allow_html=True)
 
-    return {
-        "vcp_setups": vcp_setups,
-        "scanned": len(all_symbols), "liquid": liquid,
-        "count": len(vcp_setups), "ready_count": ready_count,
-        "timestamp": datetime.now().strftime("%d %b %Y %H:%M"),
-    }
+    # ── Custom stock input ─────────────────────────────────────────────────────
+    with st.expander("➕ Add Custom Stocks to Scan", expanded=False):
+        st.caption("Enter US symbols (comma-separated). These are added to the scan universe temporarily.")
+        custom_raw = st.text_area(
+            "Custom symbols", value=st.session_state.get("custom_stocks_input",""),
+            placeholder="AAPL, NVDA, TSLA, SPY...",
+            label_visibility="collapsed", height=80)
+        if st.button("✅ Apply Custom List"):
+            # Store and inject into signals module
+            symbols = [s.strip().upper() for s in custom_raw.split(",") if s.strip()]
+            st.session_state.custom_stocks_input = custom_raw
+            if symbols:
+                import signals as _sg
+                if "Custom" not in _sg.SECTOR_STOCKS:
+                    _sg.SECTOR_STOCKS["Custom"] = []
+                _sg.SECTOR_STOCKS["Custom"] = symbols
+                for sym in symbols:
+                    _sg.SECTOR_MAP[sym] = "Custom"
+                st.success(f"✅ Added {len(symbols)} custom stocks to scan universe")
+            else:
+                import signals as _sg
+                _sg.SECTOR_STOCKS.pop("Custom", None)
+                st.info("Custom list cleared.")
 
-def scan_relative_strength(top_n=None, min_rating=0):
-    """
-    Rank the entire universe by Relative Strength versus Nifty.
+    if st.button("⚡ Execute Global Scan", width="stretch"):
+        with st.spinner(f"Scanning {min(MAX_SCAN_SYMBOLS, len(SECTOR_MAP))} tickers..."):
+            sd = generate_market_scanner()
+            st.session_state.scanner_cache = sd if (sd is not None and not sd.empty) \
+                else pd.DataFrame()
+            if (st.session_state.scanner_cache is not None and
+                    not st.session_state.scanner_cache.empty):
+                _sc = st.session_state.scanner_cache
+                _has_liq = "Liquid" in _sc.columns
+                liq_ok  = int((_sc["Liquid"]=="✅").sum()) if _has_liq else 0
+                liq_low = int((_sc["Liquid"]=="⚠️ Low").sum()) if _has_liq else 0
+                st.toast(
+                    f"✅ {len(_sc)} setups | "
+                    f"💧 {liq_ok} liquid · ⚠️ {liq_low} low-liq",
+                    icon="🚀")
+            st.rerun()
 
-    Computes each liquid stock's RS ratio, then converts to a 1-99 percentile
-    RS Rating (IBD-style): 99 = strongest leader, 1 = weakest laggard.
+    scan_df = st.session_state.scanner_cache
+    if scan_df is None:
+        st.info("💡 Initiate scan above or await automated background scan.")
+    elif scan_df.empty:
+        st.warning("⚠️ Zero setups passed pattern gates today.")
+    else:
+        all_sectors = sorted(scan_df["Sector"].unique().tolist())
 
-    Args:
-        top_n      : if set, return only the top N leaders
-        min_rating : only include stocks with RS Rating >= this (0-99)
+        # ── Sector summary cards ───────────────────────────────────────────────
+        _has_liq_col = "Liquid" in scan_df.columns
+        _agg = {"total": ("Stock","count"),
+                "strong": ("Signal", lambda x: (x=="🔥 STRONG BUY").sum()),
+                "buy":    ("Signal", lambda x: (x=="🟢 BUY SETUP").sum())}
+        if _has_liq_col:
+            _agg["liq"] = ("Liquid", lambda x: (x=="✅").sum())
+        sector_stats = scan_df.groupby("Sector").agg(**_agg).reset_index()
+        if not _has_liq_col:
+            sector_stats["liq"] = 0
+        cards_html = ""
+        for _, sr in sector_stats.iterrows():
+            hot = sr["strong"] + sr["buy"]
+            clr = theme_t["green"] if hot > 0 else theme_t["muted"]
+            bdr = theme_t["accent"] if hot > 0 else theme_t["border"]
+            cards_html += (
+                f'<div style="background:var(--card);border:1px solid {bdr};'
+                f'border-radius:10px;padding:.8rem 1rem;min-width:150px;flex:1">'
+                f'<div style="font-size:.78rem;font-weight:800;color:var(--text);'
+                f'white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'
+                f'{sr["Sector"]}</div>'
+                f'<div style="font-size:1.1rem;font-weight:800;color:{clr};margin:.2rem 0">'
+                f'{int(sr["total"])}<span style="font-size:.65rem;color:var(--muted)"> stocks</span></div>'
+                f'<div style="font-size:.68rem;color:var(--muted)">'
+                f'🔥{int(sr["strong"])} 🟢{int(sr["buy"])} '
+                f'· 💧{int(sr["liq"])} liquid</div></div>'
+            )
+        st.markdown(
+            f'<div style="display:flex;gap:.5rem;flex-wrap:wrap;'
+            f'margin-bottom:1rem">{cards_html}</div>',
+            unsafe_allow_html=True)
 
-    Returns:
-        {
-          "leaders": list[dict] sorted by RS rating desc,
-          "scanned": int, "liquid": int, "count": int,
-          "nifty_returns": dict, "timestamp": str,
-        }
-    Each row: stock, sector, cmp, rs_ratio, rs_rating, ret_21d, ret_63d,
-              ret_252d, nifty_21d, outperforming, trend
-    """
-    bench = _get_nifty_benchmark()
-    if bench is None:
-        return {"leaders": [], "scanned": 0, "liquid": 0, "count": 0,
-                "nifty_returns": {}, "timestamp": datetime.now().strftime("%d %b %Y %H:%M"),
-                "error": "Could not fetch Nifty benchmark data"}
+        # ── Stable filter controls ──────────────────────────────────────────────
+        fc1, fc2, fc3, fc4, fc5 = st.columns([2, 1.5, 1.2, 1, 1])
+        with fc1:
+            sector_options = ["All Sectors"] + all_sectors
+            sel_sector = st.selectbox("Sector", sector_options,
+                index=sector_options.index(st.session_state.selected_scanner_sector)
+                if st.session_state.selected_scanner_sector in sector_options else 0,
+                label_visibility="collapsed")
+            if sel_sector != st.session_state.selected_scanner_sector:
+                st.session_state.selected_scanner_sector = sel_sector
+        with fc2:
+            signal_opts = ["All Signals","🔥 STRONG BUY","🟢 BUY SETUP",
+                           "🟡 ACCUMULATE","⚪ NEUTRAL","🔴 AVOID"]
+            sel_signal = st.selectbox("Signal", signal_opts, label_visibility="collapsed")
+        with fc3:
+            _has_liq_col2 = "Liquid" in scan_df.columns if scan_df is not None else False
+            liq_opts = (["All","✅ Liquid Only","⚠️ Low Liq Only"]
+                        if _has_liq_col2 else ["All"])
+            sel_liq = st.selectbox("Liquidity", liq_opts, label_visibility="collapsed")
+        with fc4:
+            search_stock = st.text_input("Search", placeholder="Symbol",
+                                         label_visibility="collapsed")
+        with fc5:
+            min_score_f = st.number_input("Min score", 0, 10, 0, 1,
+                                          label_visibility="collapsed")
 
-    all_symbols = get_scan_symbols()
+        # ── Apply filters ───────────────────────────────────────────────────────
+        fdf = scan_df.copy()
+        if sel_sector != "All Sectors":
+            fdf = fdf[fdf["Sector"] == sel_sector]
+        if sel_signal != "All Signals":
+            fdf = fdf[fdf["Signal"] == sel_signal]
+        if "Liquid" in fdf.columns:
+            if sel_liq == "✅ Liquid Only":
+                fdf = fdf[fdf["Liquid"] == "✅"]
+            elif sel_liq == "⚠️ Low Liq Only":
+                fdf = fdf[fdf["Liquid"] == "⚠️ Low"]
+        if search_stock.strip():
+            fdf = fdf[fdf["Stock"].str.upper().str.contains(
+                search_stock.strip().upper())]
+        if min_score_f > 0:
+            fdf = fdf[fdf["Score"] >= min_score_f]
 
-    bulk = _bulk_fetch_history(all_symbols, period="1y")
+        # ── Strategy quick-filters (VCP / RS leaders / hide traps) ──────────────
+        if any(col in fdf.columns for col in ("VCP", "RS", "Trap")):
+            qf1, qf2, qf3, qf4 = st.columns(4)
+            with qf1:
+                only_vcp = st.checkbox("📐 VCP bases only", value=False, key="scn_vcp")
+            with qf2:
+                only_rs = st.checkbox("💪 RS leaders only", value=False, key="scn_rs")
+            with qf3:
+                ready_only = st.checkbox("🎯 VCP pivot-ready", value=False, key="scn_ready")
+            with qf4:
+                hide_traps = st.checkbox("🚫 Hide traps", value=False, key="scn_notrap")
+            if only_vcp and "VCP" in fdf.columns:
+                fdf = fdf[fdf["VCP"] != "—"]
+            if ready_only and "VCP" in fdf.columns:
+                fdf = fdf[fdf["VCP"].str.contains("READY", na=False)]
+            if only_rs and "RS_Lead" in fdf.columns:
+                fdf = fdf[fdf["RS_Lead"] == "💪"]
+            if hide_traps and "Trap" in fdf.columns:
+                fdf = fdf[fdf["Trap"] == "—"]
 
-    rows = []
-    ratios = []
-    liquid = 0
-    for symbol in all_symbols:
-        df  = bulk.get(symbol)
-        ind = compute_indicators(symbol, period="1y", prefetched_df=df)
-        if not ind:
-            continue
-        if not ind.get("liquidity_ok", True):
-            continue
-        liquid += 1
-        rs_ratio = ind.get("rs_ratio")
-        if rs_ratio is None:
-            continue
-        ratios.append(rs_ratio)
-        periods = ind.get("rs_periods") or {}
-        rows.append({
-            "stock": symbol, "sector": get_sector(symbol), "cmp": ind.get("cmp"),
-            "rs_ratio": rs_ratio, "outperforming": ind.get("rs_outperforming"),
-            "trend": ind.get("trend"),
-            "ret_21d": periods.get("21", {}).get("stock"),
-            "ret_63d": periods.get("63", {}).get("stock"),
-            "ret_252d": periods.get("252", {}).get("stock"),
-            "nifty_21d": periods.get("21", {}).get("nifty"),
-            "vcp": ind.get("vcp", False), "vcp_ready": ind.get("vcp_ready", False),
-        })
+        display_df = fdf.drop(columns=["Sector"]) if sel_sector != "All Sectors" else fdf
 
-    # Assign 1-99 percentile rating across all measured stocks
-    for r in rows:
-        r["rs_rating"] = _rs_ratio_to_rating(r["rs_ratio"], ratios)
+        liq_count = int((fdf["Liquid"]=="✅").sum()) if "Liquid" in fdf.columns else 0
+        st.markdown(
+            f'<div style="font-size:.78rem;color:var(--muted);margin-bottom:.4rem;'
+            f'font-weight:600">Showing {len(fdf)} of {len(scan_df)} results · '
+            f'💧 {liq_count} liquid</div>',
+            unsafe_allow_html=True)
 
-    # Filter + sort
-    rows = [r for r in rows if (r["rs_rating"] or 0) >= min_rating]
-    rows.sort(key=lambda r: r["rs_rating"] or 0, reverse=True)
-    if top_n:
-        rows = rows[:top_n]
+        # ── Single stable dataframe with fixed height ───────────────────────────
+        st.dataframe(
+            display_df.reset_index(drop=True),
+            hide_index=True, height=600, use_container_width=True,
+            column_config={
+                "Generated":    st.column_config.TextColumn("Time",     width="small"),
+                "Sector":       st.column_config.TextColumn("Sector",   width="medium"),
+                "Stock":        st.column_config.TextColumn("Stock",    width="small"),
+                "Signal":       st.column_config.TextColumn("Signal",   width="medium"),
+                "Liquid":       st.column_config.TextColumn("💧 Liq",   width="small"),
+                "Turnover_M":  st.column_config.NumberColumn("$M/day",format="%.1f"),
+                "Score":        st.column_config.NumberColumn("Score",  format="%d"),
+                "CMP":     st.column_config.NumberColumn("CMP",    format="$%.2f"),
+                "Entry":   st.column_config.NumberColumn("Entry",  format="$%.2f"),
+                "Target":  st.column_config.NumberColumn("Target", format="$%.2f"),
+                "SL":      st.column_config.NumberColumn("SL",     format="$%.2f"),
+                "Support": st.column_config.NumberColumn("Support",format="$%.2f"),
+                "Resist":  st.column_config.NumberColumn("Resist", format="$%.2f"),
+                "RSI":     st.column_config.NumberColumn("RSI",    format="%.1f"),
+                "Trend":   st.column_config.TextColumn("Trend",   width="medium"),
+                "VCP":     st.column_config.TextColumn("📐 VCP",  width="small"),
+                "Trap":    st.column_config.TextColumn("🪤 Trap", width="medium"),
+                "RS":      st.column_config.NumberColumn("💪 RS", format="%.2f"),
+                "RS_Lead": st.column_config.TextColumn("Lead",    width="small"),
+                "Patterns":st.column_config.TextColumn("Patterns",width="large"),
+            })
 
-    return {
-        "leaders": rows,
-        "scanned": len(all_symbols), "liquid": liquid, "count": len(rows),
-        "nifty_returns": bench,
-        "timestamp": datetime.now().strftime("%d %b %Y %H:%M"),
-    }
+# ── Metrics ──────────────────────────────────────────────────────────────────
+elif _page == 'metrics':
+    a = calc_analytics(df)
+    if not a or a.get("closed_trades", 0) == 0:
+        st.info("Metrics require historical closed trades.")
+    else:
+        st.markdown('<div class="sec">Strategy Performance Metrics</div>',
+                    unsafe_allow_html=True)
+        st.markdown(
+            '<div class="cards">'
+            + card("Win Rate",      f'{a["win_rate"]}%',
+                   f'{a["wins"]}W / {a["losses"]}L',
+                   "green" if a["win_rate"] >= 50 else "red")
+            + card("Profit Factor", str(a["profit_factor"]), "Gross P / Gross L")
+            + card("Expectancy",    f'${a["expectancy"]}')
+            + card("Avg Win",       f'${a["avg_win"]:,.0f}')
+            + card("Avg Loss",      f'${a["avg_loss"]:,.0f}', "", "red")
+            + card("Max Drawdown",  f'${a["max_drawdown"]:,.0f}', "", "red")
+            + card("Avg Hold",      f'{a["avg_hold_days"]}d')
+            + card("Sharpe",        str(a["sharpe"]))
+            + '</div>',
+            unsafe_allow_html=True)
+
+# ── Watchlist ────────────────────────────────────────────────────────────────
+elif _page == 'watchlist':
+    st.markdown('<div class="sec">👁 Target Watchlist</div>', unsafe_allow_html=True)
+
+    def drop_watchlist_cb(w_id, s_name):
+        delete_watchlist_item(w_id, UID)
+        st.toast(f"🗑️ Dropped {s_name}")
+
+    with st.form(key="add_stock_form", clear_on_submit=True):
+        col_inp, col_btn = st.columns([4, 1])
+        with col_inp:
+            new_stock = st.text_input(
+                "Stock Ticker", placeholder="e.g., AAPL, MSFT",
+                label_visibility="collapsed").upper().strip()
+        with col_btn:
+            if st.form_submit_button("➕ Add", width="stretch") and new_stock:
+                add_watchlist(UID, new_stock)
+                st.toast(f"🚀 {new_stock} added!")
+                st.rerun()
+
+    wdf = get_watchlist(UID)
+    if not wdf.empty:
+        st.markdown('<div class="sec" style="margin-top:1rem">Live Monitored Assets</div>',
+                    unsafe_allow_html=True)
+        wl_symbols = wdf["stock"].tolist()
+        with st.spinner("Fetching live metrics..."):
+            wl_data = _bulk_fetch_history(wl_symbols, period="3mo")
+
+        cols = st.columns(3)
+        for i, row in wdf.iterrows():
+            stock = row["stock"]
+            wid   = int(row["id"])
+            col   = cols[i % 3]
+            with col:
+                df_hist = wl_data.get(stock)
+                ind = compute_indicators(stock, period="3mo", prefetched_df=df_hist)
+                if ind:
+                    cmp_v  = ind.get("cmp", "—")
+                    rsi_v  = ind.get("rsi", "—")
+                    trend  = ind.get("trend", "—")
+                    sup    = ind.get("support", "—")
+                    res    = ind.get("resistance", "—")
+                    ema9   = ind.get("ema9",  ind.get("ema20", "—"))
+                    ema21  = ind.get("ema21", ind.get("ema50", "—"))
+                    brd = (theme_t["green"]  if "Uptrend"   in str(trend)
+                           else theme_t["red"] if "Downtrend" in str(trend)
+                           else theme_t["yellow"])
+                    st.markdown(f"""
+<div style="background:var(--card);border-top:4px solid {brd};border-radius:8px;
+     padding:1rem;box-shadow:0 4px 6px rgba(0,0,0,.05);margin-bottom:.5rem">
+  <div style="font-size:1.1rem;font-weight:800;color:var(--text)">{stock}</div>
+  <div style="font-size:.75rem;color:var(--muted);margin-bottom:.5rem;
+       text-transform:uppercase">{get_sector(stock)}</div>
+  <div style="font-size:.8rem;line-height:1.6;color:var(--text)">
+    <b>CMP:</b> ${cmp_v}<br>
+    <b>RSI:</b> {rsi_v} | <b>Trend:</b> {trend}<br>
+    <b>EMA9:</b> ${ema9} | <b>EMA21:</b> ${ema21}<br>
+    <b>Sup:</b> ${sup} | <b>Res:</b> ${res}
+  </div>
+</div>""", unsafe_allow_html=True)
+                else:
+                    st.markdown(f"""
+<div style="background:var(--card);border-top:4px solid var(--muted);
+     border-radius:8px;padding:1rem;margin-bottom:.5rem">
+  <div style="font-size:1.1rem;font-weight:800;color:var(--text)">{stock}</div>
+  <div style="font-size:.85rem;color:var(--red);margin-bottom:.5rem">
+    Data Unavailable — check symbol</div>
+</div>""", unsafe_allow_html=True)
+
+                st.button("🗑️ Drop", key=f"wl_del_{wid}",
+                          on_click=drop_watchlist_cb,
+                          args=(wid, stock), width="stretch")
+    else:
+        st.info("Watchlist empty. Add a ticker above.")
+
+# ── Export ───────────────────────────────────────────────────────────────────
+elif _page == 'export':
+    if df.empty:
+        st.info("No data available for export.")
+    else:
+        st.markdown('<div class="sec">Raw Database Export</div>',
+                    unsafe_allow_html=True)
+        st.dataframe(df)
+        csv = df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "⬇️ Download CSV", csv,
+            file_name=f"swing_portfolio_{datetime.now().strftime('%Y%m%d')}.csv",
+            mime="text/csv")
+
+# ── Signal Scores ────────────────────────────────────────────────────────────
+elif _page == 'scores':
+    st.markdown('<div class="sec">🎯 signals.py — Component Scorecard</div>',
+                unsafe_allow_html=True)
+    render_score_dashboard()
+    st.markdown("""
+<div style="margin-top:1rem;padding:1rem;background:rgba(16,185,129,.08);
+     border:1px solid rgba(16,185,129,.3);border-radius:8px;font-size:.85rem;
+     color:var(--muted);line-height:1.8">
+<b style="color:var(--text)">✅ Engine capabilities:</b><br>
+1. <b>Core indicators</b> — Wilder RSI/ATR, single-pass MACD, numpy Supertrend, clamped Bollinger, 20-day VWAP, swing-peak Fibonacci<br>
+2. <b>Risk engine</b> — unified <code>_calc_risk_params</code> across signals, picks, and scanner (zero phantom RR)<br>
+3. <b>Trap scanner</b> — 5-factor bull/bear trap confluence across the full universe<br>
+4. <b>Smart Money (SMC)</b> — FVG, order blocks, liquidity pools, premium/discount, displacement<br>
+5. <b>VCP</b> — Minervini volatility-contraction base detection with pivot-ready flagging<br>
+6. <b>Relative Strength</b> — IBD-style RS ratio + 1-99 percentile leadership rating vs S&P<br>
+7. <b>Unified in scanner</b> — VCP, Trap, and RS now surface as columns + filters in the Universe Scanner
+</div>""", unsafe_allow_html=True)
+
+# ── Trap Scanner ─────────────────────────────────────────────────────────────
+elif _page == 'traps':
+    if not _TRAP_SCANNER_AVAILABLE:
+        st.warning("🪤 Trap Scanner requires the updated **signals.py** (v12+). "
+                   "Deploy the new signals.py from the project outputs to enable this tab.",
+                   icon="⚠️")
+    st.markdown('<div class="sec">🪤 Bull & Bear Trap Scanner — Full US universe</div>',
+                unsafe_allow_html=True)
+
+    # ── Summary banner ─────────────────────────────────────────────────────────
+    trap_data = st.session_state.trap_scan_cache
+    if trap_data:
+        bull_n = trap_data.get("bull_count", 0)
+        bear_n = trap_data.get("bear_count", 0)
+        scanned = trap_data.get("scanned", 0)
+        liquid  = trap_data.get("liquid", 0)
+        ts      = trap_data.get("timestamp", "—")
+        st.markdown(
+            f'<div style="display:flex;gap:1rem;flex-wrap:wrap;margin-bottom:1.5rem">'
+            f'<div style="background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3);'
+            f'border-radius:10px;padding:.7rem 1.2rem;font-weight:800;font-size:.9rem">'
+            f'🔴 Bull Traps: <span style="color:var(--red)">{bull_n}</span></div>'
+            f'<div style="background:rgba(16,185,129,.1);border:1px solid rgba(16,185,129,.3);'
+            f'border-radius:10px;padding:.7rem 1.2rem;font-weight:800;font-size:.9rem">'
+            f'🟢 Bear Traps: <span style="color:var(--green)">{bear_n}</span></div>'
+            f'<div style="background:var(--card);border:1px solid var(--border);'
+            f'border-radius:10px;padding:.7rem 1.2rem;font-size:.8rem;color:var(--muted);font-weight:600">'
+            f'🔍 Scanned: {scanned} | Liquid: {liquid} | Updated: {ts}</div>'
+            f'</div>',
+            unsafe_allow_html=True)
+
+    # ── Controls ────────────────────────────────────────────────────────────────
+    ctrl1, ctrl2, ctrl3 = st.columns([2, 1, 1])
+    with ctrl1:
+        st.caption("⚡ Sweeps all US universe liquid stocks for false breakout / breakdown patterns.")
+    with ctrl2:
+        min_conf = st.slider("Min Confidence %", 50, 90, 60, 5, label_visibility="collapsed")
+    with ctrl3:
+        run_trap_scan = st.button("🪤 Run Trap Scan", width="stretch")
+
+    if run_trap_scan:
+        total_sym = min(MAX_SCAN_SYMBOLS, len(SECTOR_MAP))
+        with st.spinner(f"🔍 Scanning {total_sym} stocks for trap patterns…"):
+            st.session_state.trap_scan_cache = scan_for_traps(min_confidence=min_conf)
+            trap_data = st.session_state.trap_scan_cache
+            st.toast(
+                f"✅ Found {trap_data['bull_count']} bull traps, "
+                f"{trap_data['bear_count']} bear traps across {trap_data['liquid']} liquid stocks",
+                icon="🪤")
+
+    if not trap_data:
+        st.info("💡 Click **🪤 Run Trap Scan** to sweep the full US universe for active trap patterns.")
+    else:
+        bull_traps = trap_data.get("bull_traps", [])
+        bear_traps = trap_data.get("bear_traps", [])
+
+        # ── Filter by confidence slider ─────────────────────────────────────────
+        bull_traps = [x for x in bull_traps if x["confidence"] >= min_conf]
+        bear_traps = [x for x in bear_traps if x["confidence"] >= min_conf]
+
+        col_bull, col_bear = st.columns(2)
+
+        # ── BULL TRAPS ──────────────────────────────────────────────────────────
+        with col_bull:
+            st.markdown(
+                f'<div style="font-size:.85rem;font-weight:800;color:var(--red);'
+                f'text-transform:uppercase;letter-spacing:.1em;margin-bottom:.8rem;'
+                f'padding:.5rem .8rem;background:rgba(239,68,68,.08);'
+                f'border-left:4px solid var(--red);border-radius:0 8px 8px 0">'
+                f'🔴 Bull Traps — Exit / Avoid ({len(bull_traps)})</div>',
+                unsafe_allow_html=True)
+
+            if not bull_traps:
+                st.success("✅ No bull traps found at this confidence level.")
+            else:
+                for bt in bull_traps:
+                  try:
+                    conf = bt["confidence"]
+                    conf_clr = "#ef4444" if conf >= 80 else "#f59e0b"
+                    st.markdown(f"""
+<div style="background:var(--card);border:1px solid rgba(239,68,68,.25);
+     border-left:4px solid var(--red);border-radius:10px;
+     padding:1rem 1.2rem;margin-bottom:.8rem;
+     box-shadow:0 4px 12px -4px rgba(239,68,68,.15)">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.4rem">
+    <span style="font-weight:800;font-size:.95rem">{bt['stock']}</span>
+    <span style="background:rgba(239,68,68,.12);color:{conf_clr};
+          padding:.2rem .6rem;border-radius:6px;font-size:.75rem;font-weight:800">
+      {conf}% CONF
+    </span>
+  </div>
+  <div style="font-size:.75rem;color:var(--muted);margin-bottom:.5rem">
+    {bt['sector']} · CMP ${bt['cmp']} · RSI {bt['rsi'] if bt['rsi'] else '—'}
+  </div>
+  <div style="font-size:.8rem;color:var(--red);font-weight:600;margin-bottom:.5rem">
+    ⚠️ {bt['detail']}
+  </div>
+  <div style="height:4px;background:var(--input);border-radius:2px;margin-bottom:.6rem">
+    <div style="height:4px;border-radius:2px;background:var(--red);width:{min(conf,100)}%"></div>
+  </div>
+  <div style="font-size:.78rem;color:var(--muted);display:grid;grid-template-columns:1fr 1fr;gap:.2rem">
+    <span>📊 Trend: {bt['trend']}</span>
+    <span>📦 Vol: {bt['vol_ratio']:.1f}x avg</span>
+    <span>🛡 Support: ${bt['support']}</span>
+    <span>🚧 Resist: ${bt['resistance']}</span>
+    <span>🔁 Re-entry SL: ${bt['re_entry_sl']}</span>
+    <span>ST: {'🟢 Bull' if bt.get('supertrend_bullish') else '🔴 Bear'}</span>
+  </div>
+  {('<div style="font-size:.72rem;color:var(--muted);margin-top:.4rem">📐 ' + bt['patterns'] + '</div>') if bt.get('patterns') else ''}
+</div>""", unsafe_allow_html=True)
+                  except Exception:
+                    st.markdown(
+                        f'<div style="background:var(--card);border:1px solid var(--border);'
+                        f'border-radius:8px;padding:.7rem 1rem;margin-bottom:.6rem;font-size:.85rem">'
+                        f'<b>{bt.get("stock","?")}</b> — bull trap '
+                        f'{bt.get("confidence","?")}% (detail unavailable)</div>',
+                        unsafe_allow_html=True)
+
+        # ── BEAR TRAPS ──────────────────────────────────────────────────────────
+        with col_bear:
+            st.markdown(
+                f'<div style="font-size:.85rem;font-weight:800;color:var(--green);'
+                f'text-transform:uppercase;letter-spacing:.1em;margin-bottom:.8rem;'
+                f'padding:.5rem .8rem;background:rgba(16,185,129,.08);'
+                f'border-left:4px solid var(--green);border-radius:0 8px 8px 0">'
+                f'🟢 Bear Traps — Buy Opportunity ({len(bear_traps)})</div>',
+                unsafe_allow_html=True)
+
+            if not bear_traps:
+                st.info("No bear traps found at this confidence level.")
+            else:
+                for brt in bear_traps:
+                  try:
+                    conf = brt["confidence"]
+                    conf_clr = "#10b981" if conf >= 80 else "#f59e0b"
+                    rr = brt.get("risk_reward")
+                    rr_str = f"R:R {rr}" if rr else "—"
+                    st.markdown(f"""
+<div style="background:var(--card);border:1px solid rgba(16,185,129,.25);
+     border-left:4px solid var(--green);border-radius:10px;
+     padding:1rem 1.2rem;margin-bottom:.8rem;
+     box-shadow:0 4px 12px -4px rgba(16,185,129,.15)">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.4rem">
+    <span style="font-weight:800;font-size:.95rem">{brt['stock']}</span>
+    <span style="background:rgba(16,185,129,.12);color:{conf_clr};
+          padding:.2rem .6rem;border-radius:6px;font-size:.75rem;font-weight:800">
+      {conf}% CONF
+    </span>
+  </div>
+  <div style="font-size:.75rem;color:var(--muted);margin-bottom:.5rem">
+    {brt['sector']} · CMP ${brt['cmp']} · RSI {brt['rsi'] if brt['rsi'] else '—'}
+  </div>
+  <div style="font-size:.8rem;color:var(--green);font-weight:600;margin-bottom:.5rem">
+    🪤 {brt['detail']}
+  </div>
+  <div style="height:4px;background:var(--input);border-radius:2px;margin-bottom:.6rem">
+    <div style="height:4px;border-radius:2px;background:var(--green);width:{min(conf,100)}%"></div>
+  </div>
+  <div style="background:rgba(16,185,129,.06);border-radius:6px;
+       padding:.6rem .8rem;margin-bottom:.5rem;
+       display:grid;grid-template-columns:1fr 1fr 1fr;gap:.3rem;font-size:.8rem;font-weight:700">
+    <span>🎯 Entry<br><b>${brt['entry']}</b></span>
+    <span>🚀 Target<br><b style="color:var(--green)">${brt['target']}</b></span>
+    <span>🛑 SL<br><b style="color:var(--red)">${brt['stop_loss']}</b></span>
+  </div>
+  <div style="font-size:.78rem;color:var(--muted);display:grid;grid-template-columns:1fr 1fr;gap:.2rem">
+    <span>📊 {rr_str}</span>
+    <span>📦 Vol: {brt['vol_ratio']:.1f}x avg</span>
+    <span>🛡 Support: ${brt['support']}</span>
+    <span>🚧 Resist: ${brt['resistance']}</span>
+    <span>📈 Trend: {brt['trend']}</span>
+    <span>ST: {'🟢 Bull' if brt.get('supertrend_bullish') else '🔴 Bear'}</span>
+  </div>
+  {('<div style="font-size:.72rem;color:var(--muted);margin-top:.4rem">📐 ' + brt['patterns'] + '</div>') if brt.get('patterns') else ''}
+</div>""", unsafe_allow_html=True)
+                  except Exception:
+                    st.markdown(
+                        f'<div style="background:var(--card);border:1px solid var(--border);'
+                        f'border-radius:8px;padding:.7rem 1rem;margin-bottom:.6rem;font-size:.85rem">'
+                        f'<b>{brt.get("stock","?")}</b> — bear trap '
+                        f'{brt.get("confidence","?")}% (detail unavailable)</div>',
+                        unsafe_allow_html=True)
+
+        # ── Export trap results ─────────────────────────────────────────────────
+        st.markdown("<br>", unsafe_allow_html=True)
+        if bull_traps or bear_traps:
+            bull_df = pd.DataFrame(bull_traps)[
+                ["stock","sector","cmp","rsi","confidence","detail","support","resistance","trend"]
+            ] if bull_traps else pd.DataFrame()
+            bear_df = pd.DataFrame(bear_traps)[
+                ["stock","sector","cmp","rsi","confidence","detail","entry","target","stop_loss","risk_reward","trend"]
+            ] if bear_traps else pd.DataFrame()
+
+            exp1, exp2 = st.columns(2)
+            with exp1:
+                if not bull_df.empty:
+                    st.download_button(
+                        "⬇️ Export Bull Traps CSV",
+                        bull_df.to_csv(index=False).encode("utf-8"),
+                        file_name=f"bull_traps_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                        mime="text/csv", use_container_width=True)
+            with exp2:
+                if not bear_df.empty:
+                    st.download_button(
+                        "⬇️ Export Bear Traps CSV",
+                        bear_df.to_csv(index=False).encode("utf-8"),
+                        file_name=f"bear_traps_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                        mime="text/csv", use_container_width=True)
+
+# ── Corporate Actions ────────────────────────────────────────────────────────
+elif _page == 'corp_actions':
+    if not _CORP_ACTIONS_AVAILABLE:
+        st.warning("📅 Corporate Actions requires the updated **signals.py** (v12+). "
+                   "Deploy the new signals.py from the project outputs to enable this tab.",
+                   icon="⚠️")
+    st.markdown('<div class="sec">📅 Corporate Actions — Full US universe</div>',
+                unsafe_allow_html=True)
+    st.caption("Dividends · Stock Splits · Bonus Issues — sourced from NSE via yfinance. 6-hour cache.")
+
+    # ── Portfolio holdings quick-view ──────────────────────────────────────────
+    open_syms = raw[raw["status"]=="Open"]["stock"].unique().tolist() if not raw.empty else []
+    if open_syms:
+        st.markdown('<div class="sec" style="margin-top:1rem">📌 Your Holdings</div>',
+                    unsafe_allow_html=True)
+        with st.spinner("Fetching corporate actions for your holdings..."):
+            port_actions = fetch_bulk_corporate_actions(open_syms, max_workers=5)
+
+        p_rows = ""
+        for sym in open_syms:
+            data = port_actions.get(sym, {})
+            div_str  = (f"${data['last_dividend']} on {data['last_div_date']}"
+                        if data.get("last_dividend") else "—")
+            exd_str  = (f'<b style="color:var(--yellow)">{data["upcoming_exdate"]}</b>'
+                        if data.get("upcoming_exdate") else "—")
+            spl_str  = (f"{data['splits'][-1]['ratio']}x on {data['splits'][-1]['date']}"
+                        if data.get("splits") else "—")
+            split_badge = ('<span style="background:rgba(59,130,246,.15);color:var(--blue);'
+                           'padding:.1rem .5rem;border-radius:4px;font-size:.7rem;'
+                           'font-weight:800">SPLIT/BONUS 1Y</span>'
+                           if data.get("has_split_1y") else "")
+            p_rows += (
+                f"<tr>"
+                f"<td style='text-align:left;font-weight:800'>{sym} {split_badge}</td>"
+                f"<td style='text-align:left;color:var(--muted);font-size:.8rem'>"
+                f"{get_sector(sym)}</td>"
+                f"<td>{div_str}</td>"
+                f"<td>{exd_str}</td>"
+                f"<td style='font-size:.78rem;color:var(--muted)'>{spl_str}</td>"
+                f"</tr>"
+            )
+        if p_rows:
+            st.markdown(
+                f'<div class="tbl-wrap"><table class="t">'
+                f'<thead><tr>'
+                f'<th class="l">Stock</th><th class="l">Sector</th>'
+                f'<th>Last Dividend</th><th>Ex-Date (upcoming)</th>'
+                f'<th>Last Split/Bonus</th>'
+                f'</tr></thead><tbody>{p_rows}</tbody></table></div>',
+                unsafe_allow_html=True)
+
+    st.markdown("<hr style='border-color:var(--border);margin:1.5rem 0'>",
+                unsafe_allow_html=True)
+
+    # ── Full universe scan controls ────────────────────────────────────────────
+    ca1, ca2 = st.columns([3, 1])
+    with ca1:
+        st.markdown(
+            '<div style="font-size:.85rem;font-weight:700;color:var(--text)">'
+            '🔍 Sweep full US universe for upcoming ex-dates, recent dividends '
+            'and bonus/split events</div>',
+            unsafe_allow_html=True)
+    with ca2:
+        run_ca_scan = st.button("📅 Scan Corporate Actions", width="stretch")
+
+    if run_ca_scan:
+        total_sym = min(MAX_SCAN_SYMBOLS, len(SECTOR_MAP))
+        with st.spinner(f"Fetching corporate actions for {total_sym} stocks… (may take 60–90s)"):
+            st.session_state.corp_actions_cache = scan_corporate_actions_universe()
+            ca = st.session_state.corp_actions_cache
+            st.toast(
+                f"✅ {len(ca['with_upcoming_exdate'])} upcoming ex-dates · "
+                f"{len(ca['recent_dividends'])} recent dividends · "
+                f"{len(ca['recent_splits'])} splits/bonus",
+                icon="📅")
+
+    ca_data = st.session_state.corp_actions_cache
+    if ca_data is None:
+        st.info("Click **📅 Scan Corporate Actions** to fetch the full US universe action calendar.")
+    else:
+        ts = ca_data.get("timestamp","—"); scanned = ca_data.get("scanned",0)
+        st.markdown(
+            f'<div style="font-size:.75rem;color:var(--muted);margin-bottom:1rem">'
+            f'Last scanned {scanned} stocks at {ts}</div>',
+            unsafe_allow_html=True)
+
+        ca_t1, ca_t2, ca_t3 = st.tabs([
+            f"📆 Upcoming Ex-Dates ({len(ca_data['with_upcoming_exdate'])})",
+            f"💰 Recent Dividends ({len(ca_data['recent_dividends'])})",
+            f"🔀 Splits & Bonus ({len(ca_data['recent_splits'])})",
+        ])
+
+        # ── Upcoming Ex-Dates ──────────────────────────────────────────────────
+        with ca_t1:
+            exd_list = ca_data["with_upcoming_exdate"]
+            if not exd_list:
+                st.info("No upcoming ex-dividend dates found.")
+            else:
+                rows = ""
+                for item in exd_list:
+                    days_away = (pd.Timestamp(item["ex_date"]) -
+                                 pd.Timestamp.now()).days
+                    urgency = (
+                        f'<span style="color:var(--red);font-weight:800">'
+                        f'⚡ {days_away}d away</span>'
+                        if days_away <= 7 else
+                        f'<span style="color:var(--yellow);font-weight:700">'
+                        f'{days_away}d</span>'
+                        if days_away <= 30 else
+                        f'<span style="color:var(--muted)">{days_away}d</span>'
+                    )
+                    div_amt = (f"${item['last_dividend']}"
+                               if item.get("last_dividend") else "—")
+                    rows += (
+                        f"<tr>"
+                        f"<td style='text-align:left;font-weight:800'>{item['stock']}</td>"
+                        f"<td style='text-align:left;color:var(--muted);font-size:.8rem'>"
+                        f"{item['sector']}</td>"
+                        f"<td><b>{item['ex_date']}</b></td>"
+                        f"<td>{urgency}</td>"
+                        f"<td>{div_amt}</td>"
+                        f"</tr>"
+                    )
+                st.markdown(
+                    f'<div class="tbl-wrap"><table class="t"><thead><tr>'
+                    f'<th class="l">Stock</th><th class="l">Sector</th>'
+                    f'<th>Ex-Date</th><th>Days Away</th><th>Last Div Amt</th>'
+                    f'</tr></thead><tbody>{rows}</tbody></table></div>',
+                    unsafe_allow_html=True)
+                # Export
+                ex_df = pd.DataFrame(exd_list)
+                st.download_button(
+                    "⬇️ Export Ex-Dates CSV",
+                    ex_df.to_csv(index=False).encode("utf-8"),
+                    file_name=f"upcoming_exdates_{datetime.now().strftime('%Y%m%d')}.csv",
+                    mime="text/csv")
+
+        # ── Recent Dividends ───────────────────────────────────────────────────
+        with ca_t2:
+            div_list = ca_data["recent_dividends"]
+            if not div_list:
+                st.info("No recent dividends found in the last 12 months.")
+            else:
+                rows = ""
+                for item in sorted(div_list, key=lambda x: x["amount"], reverse=True):
+                    rows += (
+                        f"<tr>"
+                        f"<td style='text-align:left;font-weight:800'>{item['stock']}</td>"
+                        f"<td style='text-align:left;color:var(--muted);font-size:.8rem'>"
+                        f"{item['sector']}</td>"
+                        f"<td><b style='color:var(--green)'>${item['amount']}</b></td>"
+                        f"<td>{item['ex_date']}</td>"
+                        f"</tr>"
+                    )
+                st.markdown(
+                    f'<div class="tbl-wrap"><table class="t"><thead><tr>'
+                    f'<th class="l">Stock</th><th class="l">Sector</th>'
+                    f'<th>Dividend $</th><th>Ex-Date</th>'
+                    f'</tr></thead><tbody>{rows}</tbody></table></div>',
+                    unsafe_allow_html=True)
+                div_df = pd.DataFrame(div_list)
+                st.download_button(
+                    "⬇️ Export Dividends CSV",
+                    div_df.to_csv(index=False).encode("utf-8"),
+                    file_name=f"recent_dividends_{datetime.now().strftime('%Y%m%d')}.csv",
+                    mime="text/csv")
+
+        # ── Splits & Bonus ─────────────────────────────────────────────────────
+        with ca_t3:
+            split_list = ca_data["recent_splits"]
+            if not split_list:
+                st.info("No stock splits or bonus issues found in the last 12 months.")
+            else:
+                rows = ""
+                for item in split_list:
+                    type_badge = (
+                        f'<span style="background:rgba(59,130,246,.15);color:var(--blue);'
+                        f'padding:.2rem .6rem;border-radius:5px;font-size:.72rem;'
+                        f'font-weight:800">{item["type"]}</span>'
+                    )
+                    rows += (
+                        f"<tr>"
+                        f"<td style='text-align:left;font-weight:800'>{item['stock']}</td>"
+                        f"<td style='text-align:left;color:var(--muted);font-size:.8rem'>"
+                        f"{item['sector']}</td>"
+                        f"<td>{type_badge}</td>"
+                        f"<td><b>{item['ratio']}:1</b></td>"
+                        f"<td>{item['date']}</td>"
+                        f"</tr>"
+                    )
+                st.markdown(
+                    f'<div class="tbl-wrap"><table class="t"><thead><tr>'
+                    f'<th class="l">Stock</th><th class="l">Sector</th>'
+                    f'<th>Type</th><th>Ratio</th><th>Date</th>'
+                    f'</tr></thead><tbody>{rows}</tbody></table></div>',
+                    unsafe_allow_html=True)
+                sp_df = pd.DataFrame(split_list)
+                st.download_button(
+                    "⬇️ Export Splits/Bonus CSV",
+                    sp_df.to_csv(index=False).encode("utf-8"),
+                    file_name=f"splits_bonus_{datetime.now().strftime('%Y%m%d')}.csv",
+                    mime="text/csv")
+
+# ── Smart Money Concepts (SMC / ICT) ──────────────────────────────────────────
+elif _page == 'smc':
+    st.markdown('<div class="sec">🏦 Smart Money Concepts — FVG · Order Blocks · Liquidity</div>',
+                unsafe_allow_html=True)
+    st.caption("Institutional footprint analysis: Fair Value Gaps, Order Blocks, "
+               "Liquidity Pools, Premium/Discount zones, and Displacement. "
+               "Optimised for NSE daily charts with circuit-filter awareness.")
+
+    # ── Stock selector: portfolio holdings + custom symbol ─────────────────────
+    open_syms = (raw[raw["status"]=="Open"]["stock"].unique().tolist()
+                 if not raw.empty else [])
+    sc1, sc2 = st.columns([2, 1])
+    with sc1:
+        symbol_options = open_syms + ["— Enter custom symbol —"]
+        sel_sym = st.selectbox("Select stock for SMC analysis", symbol_options,
+                               label_visibility="collapsed")
+    with sc2:
+        custom_sym = st.text_input("Custom", placeholder="e.g. AAPL",
+                                   label_visibility="collapsed")
+
+    target_sym = (custom_sym.strip().upper() if custom_sym.strip()
+                  else (sel_sym if sel_sym != "— Enter custom symbol —" else None))
+
+    if not target_sym:
+        st.info("💡 Select a holding or enter any US symbol to see its Smart Money structure.")
+    else:
+        with st.spinner(f"Analysing {target_sym} institutional structure…"):
+            try:
+                ind = compute_indicators(target_sym, period="6mo")
+            except Exception as e:
+                ind = None
+                st.error(f"Could not analyse {target_sym}: {e}")
+
+        if ind:
+            cmp = ind.get("cmp", 0)
+            score = ind.get("smc_score", 0)
+            label = ind.get("smc_label", "Neutral SMC")
+            zone  = ind.get("smc_zone", "Unknown")
+            bias  = ind.get("smc_bias", "Neutral")
+            action = ind.get("smc_action", "WAIT")
+            entry  = ind.get("smc_entry")
+            target = ind.get("smc_target")
+            sl     = ind.get("smc_sl")
+            rr     = ind.get("smc_rr")
+            quality = ind.get("smc_setup_quality")
+            reason = ind.get("smc_setup_reason", "")
+
+            # ── ACTIONABLE TRADE SETUP CARD (the headline) ─────────────────────
+            if action in ("BUY", "SELL") and entry:
+                act_clr = theme_t["green"] if action == "BUY" else theme_t["red"]
+                act_bg  = ("rgba(16,185,129,.08)" if action == "BUY"
+                           else "rgba(239,68,68,.08)")
+                q_clr = ("#fbbf24" if quality == "A+" else
+                         theme_t["accent"] if quality == "A" else theme_t["muted"])
+                st.markdown(
+                    f'<div style="background:{act_bg};border:2px solid {act_clr};'
+                    f'border-radius:14px;padding:1.4rem;margin:1rem 0">'
+                    f'<div style="display:flex;justify-content:space-between;'
+                    f'align-items:center;margin-bottom:1rem">'
+                    f'<div style="font-size:1.8rem;font-weight:800;color:{act_clr}">'
+                    f'{"🟢" if action=="BUY" else "🔴"} {action} {target_sym}</div>'
+                    f'<div style="background:{q_clr};color:#000;padding:.3rem .9rem;'
+                    f'border-radius:8px;font-size:.95rem;font-weight:800">'
+                    f'{quality} Setup</div></div>'
+                    f'<div style="display:grid;grid-template-columns:repeat(4,1fr);'
+                    f'gap:.8rem;margin-bottom:1rem">'
+                    f'<div style="background:var(--card);border-radius:10px;padding:.9rem;'
+                    f'text-align:center"><div style="font-size:.7rem;color:var(--muted);'
+                    f'font-weight:700;text-transform:uppercase">Entry</div>'
+                    f'<div style="font-size:1.3rem;font-weight:800;color:var(--text)">'
+                    f'${entry}</div></div>'
+                    f'<div style="background:var(--card);border-radius:10px;padding:.9rem;'
+                    f'text-align:center"><div style="font-size:.7rem;color:var(--muted);'
+                    f'font-weight:700;text-transform:uppercase">Target</div>'
+                    f'<div style="font-size:1.3rem;font-weight:800;color:{theme_t["green"]}">'
+                    f'${target}</div></div>'
+                    f'<div style="background:var(--card);border-radius:10px;padding:.9rem;'
+                    f'text-align:center"><div style="font-size:.7rem;color:var(--muted);'
+                    f'font-weight:700;text-transform:uppercase">Stop Loss</div>'
+                    f'<div style="font-size:1.3rem;font-weight:800;color:{theme_t["red"]}">'
+                    f'${sl}</div></div>'
+                    f'<div style="background:var(--card);border-radius:10px;padding:.9rem;'
+                    f'text-align:center"><div style="font-size:.7rem;color:var(--muted);'
+                    f'font-weight:700;text-transform:uppercase">Risk:Reward</div>'
+                    f'<div style="font-size:1.3rem;font-weight:800;color:var(--accent)">'
+                    f'1:{rr}</div></div>'
+                    f'</div>'
+                    f'<div style="font-size:.82rem;color:var(--muted);line-height:1.6">'
+                    f'📋 {reason}</div>'
+                    f'</div>',
+                    unsafe_allow_html=True)
+            else:
+                st.markdown(
+                    f'<div style="background:var(--card);border:2px solid var(--border);'
+                    f'border-radius:14px;padding:1.4rem;margin:1rem 0;text-align:center">'
+                    f'<div style="font-size:1.5rem;font-weight:800;color:var(--muted)">'
+                    f'⏸ WAIT — {target_sym}</div>'
+                    f'<div style="font-size:.85rem;color:var(--muted);margin-top:.5rem">'
+                    f'{reason}</div></div>',
+                    unsafe_allow_html=True)
+
+            # ── Context cards (now secondary, below the action) ────────────────
+            score_clr = (theme_t["green"] if score >= 35 else
+                         theme_t["red"] if score <= -35 else theme_t["muted"])
+            zone_clr  = (theme_t["red"] if zone == "Premium" else
+                         theme_t["green"] if zone == "Discount" else theme_t["muted"])
+            st.markdown(
+                f'<div style="display:flex;gap:1rem;flex-wrap:wrap;margin:1rem 0">'
+                f'<div style="flex:1;min-width:180px;background:var(--card);'
+                f'border:1px solid {score_clr};border-radius:12px;padding:1.2rem">'
+                f'<div style="font-size:.7rem;color:var(--muted);font-weight:700;'
+                f'text-transform:uppercase;letter-spacing:.08em">SMC Bias</div>'
+                f'<div style="font-size:1.5rem;font-weight:800;color:{score_clr};'
+                f'margin:.2rem 0">{label}</div>'
+                f'<div style="font-size:.8rem;color:var(--muted)">Score: {score:+d} / 100</div>'
+                f'</div>'
+                f'<div style="flex:1;min-width:180px;background:var(--card);'
+                f'border:1px solid {zone_clr};border-radius:12px;padding:1.2rem">'
+                f'<div style="font-size:.7rem;color:var(--muted);font-weight:700;'
+                f'text-transform:uppercase;letter-spacing:.08em">Premium/Discount</div>'
+                f'<div style="font-size:1.5rem;font-weight:800;color:{zone_clr};'
+                f'margin:.2rem 0">{zone}</div>'
+                f'<div style="font-size:.8rem;color:var(--muted)">'
+                f'{ind.get("smc_zone_pct","—")}% of range · {bias} bias</div>'
+                f'</div>'
+                f'<div style="flex:1;min-width:180px;background:var(--card);'
+                f'border:1px solid var(--border);border-radius:12px;padding:1.2rem">'
+                f'<div style="font-size:.7rem;color:var(--muted);font-weight:700;'
+                f'text-transform:uppercase;letter-spacing:.08em">CMP</div>'
+                f'<div style="font-size:1.5rem;font-weight:800;color:var(--text);'
+                f'margin:.2rem 0">${cmp}</div>'
+                f'<div style="font-size:.8rem;color:var(--muted)">'
+                f'Range ${ind.get("smc_range_low","—")}–${ind.get("smc_range_high","—")}</div>'
+                f'</div>'
+                f'</div>',
+                unsafe_allow_html=True)
+
+            # ── Displacement banner ────────────────────────────────────────────
+            disp = ind.get("smc_displacement")
+            if disp:
+                d_ago = ind.get("smc_displacement_bars_ago", "?")
+                d_clr = theme_t["green"] if disp == "Bullish" else theme_t["red"]
+                st.markdown(
+                    f'<div style="background:rgba(0,0,0,.15);border-left:4px solid {d_clr};'
+                    f'border-radius:0 8px 8px 0;padding:.7rem 1rem;margin-bottom:1rem;'
+                    f'font-size:.85rem">⚡ <b style="color:{d_clr}">{disp} Displacement</b> '
+                    f'detected {d_ago} bar(s) ago — institutional momentum present.</div>',
+                    unsafe_allow_html=True)
+
+            # ── Four detail panels ─────────────────────────────────────────────
+            colA, colB = st.columns(2)
+
+            # FVG panel
+            with colA:
+                st.markdown('<div style="font-size:.85rem;font-weight:800;color:var(--text);'
+                            'margin-bottom:.5rem">📊 Fair Value Gaps</div>',
+                            unsafe_allow_html=True)
+                nbf = ind.get("smc_nearest_bull_fvg")
+                nbef = ind.get("smc_nearest_bear_fvg")
+                in_bull = ind.get("smc_in_bull_fvg")
+                in_bear = ind.get("smc_in_bear_fvg")
+                fvg_rows = ""
+                if in_bull:
+                    fvg_rows += ('<div style="color:var(--green);font-size:.82rem;'
+                                 'margin-bottom:.3rem">📍 Price currently INSIDE a bullish FVG (support)</div>')
+                if in_bear:
+                    fvg_rows += ('<div style="color:var(--red);font-size:.82rem;'
+                                 'margin-bottom:.3rem">📍 Price currently INSIDE a bearish FVG (resistance)</div>')
+                if nbf:
+                    fvg_rows += (f'<div style="font-size:.82rem;margin-bottom:.3rem">'
+                                 f'🟢 Nearest bull FVG below: <b>${nbf["bottom"]}–${nbf["top"]}</b> '
+                                 f'({nbf["size_atr"]} ATR)</div>')
+                if nbef:
+                    fvg_rows += (f'<div style="font-size:.82rem;margin-bottom:.3rem">'
+                                 f'🔴 Nearest bear FVG above: <b>${nbef["bottom"]}–${nbef["top"]}</b> '
+                                 f'({nbef["size_atr"]} ATR)</div>')
+                fvg_rows += (f'<div style="font-size:.75rem;color:var(--muted);margin-top:.4rem">'
+                             f'Unfilled: {ind.get("smc_bull_fvg_count",0)} bullish · '
+                             f'{ind.get("smc_bear_fvg_count",0)} bearish</div>')
+                if not (nbf or nbef or in_bull or in_bear):
+                    fvg_rows = '<div style="font-size:.82rem;color:var(--muted)">No significant unfilled FVGs nearby.</div>'
+                st.markdown(f'<div style="background:var(--card);border:1px solid var(--border);'
+                            f'border-radius:10px;padding:1rem">{fvg_rows}</div>',
+                            unsafe_allow_html=True)
+
+            # Order Block panel
+            with colB:
+                st.markdown('<div style="font-size:.85rem;font-weight:800;color:var(--text);'
+                            'margin-bottom:.5rem">🧱 Order Blocks</div>',
+                            unsafe_allow_html=True)
+                nbo = ind.get("smc_nearest_bull_ob")
+                nbeo = ind.get("smc_nearest_bear_ob")
+                ob_rows = ""
+                if ind.get("smc_at_bull_ob"):
+                    ob_rows += ('<div style="color:var(--green);font-size:.82rem;'
+                                'margin-bottom:.3rem">📍 Price at a bullish order block (demand)</div>')
+                if ind.get("smc_at_bear_ob"):
+                    ob_rows += ('<div style="color:var(--red);font-size:.82rem;'
+                                'margin-bottom:.3rem">📍 Price at a bearish order block (supply)</div>')
+                if nbo:
+                    ob_rows += (f'<div style="font-size:.82rem;margin-bottom:.3rem">'
+                                f'🟢 Bull OB (demand): <b>${nbo["bottom"]}–${nbo["top"]}</b> '
+                                f'({nbo["strength_atr"]} ATR move)</div>')
+                if nbeo:
+                    ob_rows += (f'<div style="font-size:.82rem;margin-bottom:.3rem">'
+                                f'🔴 Bear OB (supply): <b>${nbeo["bottom"]}–${nbeo["top"]}</b> '
+                                f'({nbeo["strength_atr"]} ATR move)</div>')
+                if not (nbo or nbeo or ind.get("smc_at_bull_ob") or ind.get("smc_at_bear_ob")):
+                    ob_rows = '<div style="font-size:.82rem;color:var(--muted)">No active order blocks nearby.</div>'
+                st.markdown(f'<div style="background:var(--card);border:1px solid var(--border);'
+                            f'border-radius:10px;padding:1rem">{ob_rows}</div>',
+                            unsafe_allow_html=True)
+
+            colC, colD = st.columns(2)
+
+            # Liquidity panel
+            with colC:
+                st.markdown('<div style="font-size:.85rem;font-weight:800;color:var(--text);'
+                            'margin:.8rem 0 .5rem">💧 Liquidity Pools</div>',
+                            unsafe_allow_html=True)
+                nbs = ind.get("smc_nearest_buyside")
+                nss = ind.get("smc_nearest_sellside")
+                liq_rows = ""
+                if nbs:
+                    liq_rows += (f'<div style="font-size:.82rem;margin-bottom:.3rem">'
+                                 f'🔼 Buy-side liquidity above: <b>${nbs["level"]}</b> '
+                                 f'({nbs["touches"]} equal highs — short stops)</div>')
+                if nss:
+                    liq_rows += (f'<div style="font-size:.82rem;margin-bottom:.3rem">'
+                                 f'🔽 Sell-side liquidity below: <b>${nss["level"]}</b> '
+                                 f'({nss["touches"]} equal lows — long stops)</div>')
+                if not (nbs or nss):
+                    liq_rows = '<div style="font-size:.82rem;color:var(--muted)">No clear liquidity clusters nearby.</div>'
+                st.markdown(f'<div style="background:var(--card);border:1px solid var(--border);'
+                            f'border-radius:10px;padding:1rem">{liq_rows}</div>',
+                            unsafe_allow_html=True)
+
+            # How to read panel
+            with colD:
+                st.markdown('<div style="font-size:.85rem;font-weight:800;color:var(--text);'
+                            'margin:.8rem 0 .5rem">📖 How to Read This</div>',
+                            unsafe_allow_html=True)
+                st.markdown(
+                    '<div style="background:var(--card);border:1px solid var(--border);'
+                    'border-radius:10px;padding:1rem;font-size:.78rem;color:var(--muted);'
+                    'line-height:1.7">'
+                    '<b style="color:var(--text)">Confluence is key:</b> a bullish setup is '
+                    'strongest when price is in <b>Discount</b>, sitting at a <b>bull Order Block</b> '
+                    'or <b>FVG</b>, with recent <b>bullish Displacement</b>. '
+                    'Liquidity pools show where price is likely drawn next (stop hunts).'
+                    '</div>',
+                    unsafe_allow_html=True)
+
+            # ── Confluence with existing signals ───────────────────────────────
+            st.markdown('<div style="font-size:.85rem;font-weight:800;color:var(--text);'
+                        'margin:1.2rem 0 .5rem">🔗 Confluence with Technical Signals</div>',
+                        unsafe_allow_html=True)
+            conf_items = []
+            if ind.get("bull_trap"):
+                conf_items.append(("🪤 Bull Trap active", "bear"))
+            if ind.get("bear_trap"):
+                conf_items.append(("🪤 Bear Trap active", "bull"))
+            if ind.get("supertrend_bullish"): conf_items.append(("Supertrend Bullish", "bull"))
+            else: conf_items.append(("Supertrend Bearish", "bear"))
+            if ind.get("rsi"):
+                if ind["rsi"] >= 70: conf_items.append((f"RSI Overbought ({ind['rsi']})", "bear"))
+                elif ind["rsi"] <= 30: conf_items.append((f"RSI Oversold ({ind['rsi']})", "bull"))
+            if score >= 35: conf_items.append(("SMC Bullish Confluence", "bull"))
+            elif score <= -35: conf_items.append(("SMC Bearish Confluence", "bear"))
+
+            chips = ""
+            for txt, side in conf_items:
+                c = theme_t["green"] if side == "bull" else theme_t["red"]
+                chips += (f'<span style="background:rgba(0,0,0,.12);border:1px solid {c};'
+                          f'color:{c};border-radius:6px;padding:.3rem .7rem;font-size:.78rem;'
+                          f'font-weight:700;margin:.2rem">{txt}</span> ')
+            st.markdown(f'<div style="display:flex;flex-wrap:wrap;gap:.3rem">{chips}</div>',
+                        unsafe_allow_html=True)
+
+    # ── Universe-wide SMC setup scanner ────────────────────────────────────────
+    st.markdown("<hr style='border-color:var(--border);margin:1.5rem 0'>",
+                unsafe_allow_html=True)
+    st.markdown('<div class="sec">🎯 Scan Universe for SMC Setups</div>',
+                unsafe_allow_html=True)
+
+    if not _SMC_SCANNER_AVAILABLE:
+        st.warning("Universe SMC scan requires the updated signals.py (with "
+                   "scan_for_smc_setups). Deploy the latest signals.py to enable.",
+                   icon="⚠️")
+    else:
+        scs1, scs2, scs3 = st.columns([1.2, 1.2, 1])
+        with scs1:
+            min_q = st.selectbox("Min quality", ["B", "A", "A+"],
+                                 label_visibility="collapsed")
+        with scs2:
+            act_f = st.selectbox("Action", ["All", "BUY", "SELL"],
+                                 label_visibility="collapsed")
+        with scs3:
+            run_smc_scan = st.button("🎯 Scan Setups", width="stretch")
+
+        if run_smc_scan:
+            with st.spinner(f"Scanning {min(MAX_SCAN_SYMBOLS, len(SECTOR_MAP))} stocks for SMC setups…"):
+                st.session_state.smc_scan_cache = scan_for_smc_setups(
+                    min_quality=min_q, action_filter=act_f)
+                sc = st.session_state.smc_scan_cache
+                st.toast(f"✅ {sc['buy_count']} BUY · {sc['sell_count']} SELL setups",
+                         icon="🎯")
+
+        sc = st.session_state.get("smc_scan_cache")
+        if sc:
+            st.markdown(
+                f'<div style="font-size:.75rem;color:var(--muted);margin:.5rem 0">'
+                f'Scanned {sc["scanned"]} · {sc["liquid"]} liquid · '
+                f'{sc["buy_count"]} BUY · {sc["sell_count"]} SELL · {sc["timestamp"]}</div>',
+                unsafe_allow_html=True)
+
+            all_setups = sc["buy_setups"] + sc["sell_setups"]
+            if all_setups:
+                rows = []
+                for s in all_setups:
+                    rows.append({
+                        "Stock": s["stock"], "Sector": s["sector"],
+                        "Action": s["action"], "Grade": s["quality"],
+                        "CMP": s["cmp"], "Entry": s["entry"],
+                        "Target": s["target"], "SL": s["stop_loss"],
+                        "RR": s["risk_reward"], "Zone": s["zone"],
+                        "SMC": s["smc_score"],
+                    })
+                setup_df = pd.DataFrame(rows)
+                # Dynamic height: ~35px per row + header, capped so it scrolls
+                _dyn_h = min(max(len(setup_df) * 36 + 40, 200), 600)
+                st.dataframe(
+                    setup_df, hide_index=True, height=_dyn_h,
+                    use_container_width=True, row_height=35,
+                    column_config={
+                        "Stock":  st.column_config.TextColumn("Stock", width="small", pinned=True),
+                        "Action": st.column_config.TextColumn("Action", width="small"),
+                        "Grade":  st.column_config.TextColumn("Grade", width="small"),
+                        "CMP":    st.column_config.NumberColumn("CMP", format="$%.2f"),
+                        "Entry":  st.column_config.NumberColumn("Entry", format="$%.2f"),
+                        "Target": st.column_config.NumberColumn("Target", format="$%.2f"),
+                        "SL":     st.column_config.NumberColumn("SL", format="$%.2f"),
+                        "RR":     st.column_config.NumberColumn("R:R", format="%.2f"),
+                        "SMC":    st.column_config.NumberColumn("Score", format="%d"),
+                    })
+                st.download_button(
+                    "⬇️ Export SMC Setups CSV",
+                    setup_df.to_csv(index=False).encode("utf-8"),
+                    file_name=f"smc_setups_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                    mime="text/csv")
+            else:
+                st.info("No setups found at this quality/action filter. Try lowering to grade B or 'All' actions.")
+        else:
+            st.info("Click **🎯 Scan Setups** to find SMC trade setups across the universe.")
+
+# ── ETF Tracker ────────────────────────────────────────────────────────────────
+elif _page == 'etfs':
+    st.markdown('<div class="sec">📈 ETF Tracker</div>', unsafe_allow_html=True)
+    if not _FUNDS_AVAILABLE:
+        st.warning("⚠️ ETF/Fund module not available. Make sure `funds.py` is in the repo.")
+    else:
+        st.caption("NSE-listed ETFs — tracked separately from your stock portfolio. "
+                   "Data via Yahoo Finance (15-min delayed).")
+
+        # Session cache for ETF scan
+        if "etf_scan_cache" not in st.session_state:
+            st.session_state.etf_scan_cache = None
+
+        c1, c2, c3 = st.columns([1, 1, 2])
+        with c1:
+            if st.button("🔍 Scan All ETFs", width="stretch"):
+                with st.spinner("Fetching ETF data…"):
+                    st.session_state.etf_scan_cache = _funds.scan_etfs()
+        with c2:
+            _cat = st.selectbox("Category", ["All", "Equity Index", "Sectoral",
+                                "Gold/Silver", "Debt/Liquid", "International"],
+                                label_visibility="collapsed")
+
+        # Single ETF lookup
+        st.markdown("##### 🔎 Look up a specific ETF")
+        etf_names = [f"{sym} — {name}" for sym, name in _funds.ETF_UNIVERSE.items()]
+        sel = st.selectbox("Select ETF", etf_names, label_visibility="collapsed")
+        sel_sym = sel.split(" — ")[0]
+        if st.button("📊 Get ETF Details"):
+            with st.spinner(f"Fetching {sel_sym}…"):
+                q = _funds.get_etf_quote(sel_sym)
+            if not q.get("has_data"):
+                st.error(f"Couldn't fetch data for {sel_sym}. Yahoo may be rate-limited — try again.")
+            else:
+                r = q["returns"]
+                day_clr = "var(--green)" if (q["day_chg"] or 0) >= 0 else "var(--red)"
+                # Signal badge styling
+                _sig = q.get("signal", "—")
+                _sig_clr = {"BUY": "#10b981", "SELL": "#ef4444",
+                            "HOLD": "#f59e0b"}.get(_sig, "#8e8e93")
+                _sig_bg  = {"BUY": "rgba(16,185,129,.15)", "SELL": "rgba(239,68,68,.15)",
+                            "HOLD": "rgba(245,158,11,.15)"}.get(_sig, "rgba(142,142,147,.15)")
+                st.markdown(f"""
+<div style="background:var(--card);border:1px solid var(--border);border-radius:12px;
+            padding:1.2rem 1.5rem;margin:.5rem 0">
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:.5rem">
+    <div>
+      <div style="font-size:1.1rem;font-weight:800;color:var(--accent)">{q['name']}</div>
+      <div style="font-size:.8rem;color:var(--muted)">{sel_sym}</div>
+    </div>
+    <div style="text-align:right">
+      <span style="background:{_sig_bg};color:{_sig_clr};font-weight:800;font-size:1rem;
+                   padding:.35rem .9rem;border-radius:8px;border:1px solid {_sig_clr}">
+            {_sig}</span>
+      <div style="font-size:.7rem;color:var(--muted);margin-top:.25rem">
+           Score {q.get('signal_score',0)} · {q.get('signal_confidence','—')} conf · RSI {q.get('rsi','—')}</div>
+    </div>
+  </div>
+  <div style="display:flex;gap:2rem;flex-wrap:wrap;margin-top:.8rem">
+    <div><span style="color:var(--muted);font-size:.75rem">CMP</span><br>
+         <b style="font-size:1.3rem">${q['cmp']}</b></div>
+    <div><span style="color:var(--muted);font-size:.75rem">Day</span><br>
+         <b style="font-size:1.3rem;color:{day_clr}">{(q['day_chg'] or 0):+.2f}%</b></div>
+    <div><span style="color:var(--muted);font-size:.75rem">50-DMA</span><br>
+         <b style="font-size:1.1rem">${q.get('dma50','—')}</b></div>
+    <div><span style="color:var(--muted);font-size:.75rem">200-DMA</span><br>
+         <b style="font-size:1.1rem">${q.get('dma200') or '—'}</b></div>
+    <div><span style="color:var(--muted);font-size:.75rem">52W High</span><br>
+         <b style="font-size:1.1rem">${q['high52']}</b></div>
+    <div><span style="color:var(--muted);font-size:.75rem">52W Low</span><br>
+         <b style="font-size:1.1rem">${q['low52']}</b></div>
+  </div>
+  <div style="margin-top:1rem;display:flex;gap:1.5rem;flex-wrap:wrap">
+    {''.join(f'<div><span style="color:var(--muted);font-size:.72rem">{k}</span><br>'
+             f'<b style="color:{"var(--green)" if (v or 0)>=0 else "var(--red)"}">'
+             f'{("+" if (v or 0)>=0 else "")}{v if v is not None else "—"}'
+             f'{"%" if v is not None else ""}</b></div>'
+             for k, v in r.items())}
+  </div>
+  {('<div style="margin-top:1rem;padding-top:.8rem;border-top:1px solid var(--border)">'
+    '<span style="color:var(--muted);font-size:.72rem">📋 Why this signal:</span><br>'
+    '<span style="font-size:.82rem">' + ' · '.join(q.get('signal_reasons', [])) + '</span></div>')
+   if q.get('signal_reasons') else ''}
+  {('<div style="margin-top:.8rem;font-size:.85rem">'
+    f'<b>Entry</b> ${q.get("entry")} &nbsp; <b>Target</b> ${q.get("target")} &nbsp; '
+    f'<b>Stop</b> ${q.get("stop_loss")}</div>')
+   if q.get('signal')=='BUY' and q.get('target') else ''}
+</div>""", unsafe_allow_html=True)
+                st.caption("⚠️ Signals are algorithmic (trend + momentum), not financial advice. "
+                           "ETFs carry market risk — do your own research.")
+
+        # Full scan results
+        if st.session_state.etf_scan_cache is not None:
+            edf = st.session_state.etf_scan_cache
+            if edf is not None and not edf.empty:
+                st.markdown(f"##### 📋 All ETFs ({len(edf)}) — sorted by 1Y return")
+                _h = min(max(len(edf) * 36 + 40, 200), 600)
+                st.dataframe(edf, width="stretch", height=_h, hide_index=True,
+                             column_config={"Symbol": st.column_config.TextColumn(pinned=True)})
+                st.download_button(
+                    "⬇️ Export ETF Data CSV",
+                    edf.to_csv(index=False).encode("utf-8"),
+                    file_name=f"etfs_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                    mime="text/csv")
+            else:
+                st.info("No ETF data returned. Yahoo Finance may be rate-limited — try again shortly.")
+        else:
+            st.info("Click **🔍 Scan All ETFs** to load the full ETF list with returns.")
+
+# ── Mutual Fund Tracker ────────────────────────────────────────────────────────
+elif _page == 'mutual_funds':
+    st.markdown('<div class="sec">🏛 Mutual Fund Tracker</div>', unsafe_allow_html=True)
+    if not _FUNDS_AVAILABLE:
+        st.warning("⚠️ ETF/Fund module not available. Make sure `funds.py` is in the repo.")
+    else:
+        st.caption("Search any Indian mutual fund by name. NAV & returns via AMFI "
+                   "(official, updated daily). Kept separate from your stock portfolio.")
+
+        # Session state for MF
+        for k, v in [("mf_search_results", []), ("mf_selected", None),
+                     ("mf_compare_list", [])]:
+            if k not in st.session_state:
+                st.session_state[k] = v
+
+        tab_search, tab_compare = st.tabs(["🔎 Search & Track", "⚖️ Compare Funds"])
+
+        with tab_search:
+            q = st.text_input("Search mutual fund",
+                              placeholder="e.g. 'parag parikh flexi cap' or 'hdfc small cap'",
+                              label_visibility="collapsed")
+            if st.button("🔎 Search") and q:
+                with st.spinner("Searching AMFI database…"):
+                    st.session_state.mf_search_results = _funds.search_mf(q)
+                if not st.session_state.mf_search_results:
+                    st.warning("No funds found (need 3+ characters). Try the fund house + scheme name.")
+
+            results = st.session_state.mf_search_results
+            if results:
+                opts = [f"{r['schemeName']}" for r in results]
+                pick = st.selectbox(f"Found {len(results)} funds — select one:", opts)
+                pick_code = next((r["schemeCode"] for r in results
+                                  if r["schemeName"] == pick), None)
+
+                cc1, cc2 = st.columns([1, 1])
+                with cc1:
+                    if st.button("📊 View Fund Details", width="stretch"):
+                        st.session_state.mf_selected = pick_code
+                with cc2:
+                    if st.button("➕ Add to Compare", width="stretch"):
+                        if pick_code and pick_code not in st.session_state.mf_compare_list:
+                            st.session_state.mf_compare_list.append(pick_code)
+                            st.toast(f"Added to compare ({len(st.session_state.mf_compare_list)})")
+
+            # Render selected fund card
+            if st.session_state.mf_selected:
+                with st.spinner("Loading fund data…"):
+                    s = _funds.mf_summary(st.session_state.mf_selected)
+                if not s.get("has_history"):
+                    st.error("Couldn't load this fund's NAV history. Try again shortly.")
+                else:
+                    r = s["returns"]
+                    _rt = s.get("rating", {})
+                    _rt_clr = {"STRONG": "#10b981", "GOOD": "#22c55e",
+                               "AVERAGE": "#f59e0b", "WEAK": "#f97316",
+                               "POOR": "#ef4444"}.get(_rt.get("rating"), "#8e8e93")
+                    _rt_bg = {"STRONG": "rgba(16,185,129,.15)", "GOOD": "rgba(34,197,94,.12)",
+                              "AVERAGE": "rgba(245,158,11,.15)", "WEAK": "rgba(249,115,22,.15)",
+                              "POOR": "rgba(239,68,68,.15)"}.get(_rt.get("rating"), "rgba(142,142,147,.15)")
+                    st.markdown(f"""
+<div style="background:var(--card);border:1px solid var(--border);border-radius:12px;
+            padding:1.2rem 1.5rem;margin:.5rem 0">
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:.5rem">
+    <div>
+      <div style="font-size:1.05rem;font-weight:800;color:var(--accent)">{s['scheme_name']}</div>
+      <div style="font-size:.78rem;color:var(--muted)">
+           {s.get('fund_house','')} · {s.get('scheme_category','')}</div>
+    </div>
+    <div style="text-align:right">
+      <span style="background:{_rt_bg};color:{_rt_clr};font-weight:800;font-size:.95rem;
+                   padding:.35rem .9rem;border-radius:8px;border:1px solid {_rt_clr}">
+            {'⭐'*_rt.get('stars',0)} {_rt.get('rating','—')}</span>
+      <div style="font-size:.7rem;color:var(--muted);margin-top:.25rem">Quality score {_rt.get('score',0)}/100</div>
+    </div>
+  </div>
+  <div style="display:flex;gap:2rem;flex-wrap:wrap;margin-top:.8rem">
+    <div><span style="color:var(--muted);font-size:.75rem">NAV</span><br>
+         <b style="font-size:1.3rem">${s['nav']}</b></div>
+    <div><span style="color:var(--muted);font-size:.75rem">As of</span><br>
+         <b style="font-size:1rem">{s['nav_date']}</b></div>
+    <div><span style="color:var(--muted);font-size:.75rem">52W High</span><br>
+         <b style="font-size:1.1rem">${s['high52']}</b></div>
+    <div><span style="color:var(--muted);font-size:.75rem">52W Low</span><br>
+         <b style="font-size:1.1rem">${s['low52']}</b></div>
+  </div>
+  <div style="margin-top:1rem;display:flex;gap:1.5rem;flex-wrap:wrap">
+    {''.join(f'<div><span style="color:var(--muted);font-size:.72rem">{k}{" (CAGR)" if k in ("3Y","5Y") else ""}</span><br>'
+             f'<b style="color:{"var(--green)" if (v or 0)>=0 else "var(--red)"}">'
+             f'{("+" if (v or 0)>=0 else "")}{v if v is not None else "—"}'
+             f'{"%" if v is not None else ""}</b></div>'
+             for k, v in r.items())}
+  </div>
+  <div style="margin-top:1rem;padding-top:.8rem;border-top:1px solid var(--border);font-size:.85rem">
+       💡 <b>{_rt.get('action','—')}</b></div>
+</div>""", unsafe_allow_html=True)
+                    st.caption("⚠️ Ratings reflect past performance (returns + consistency), "
+                               "not a buy/sell timing call. Mutual funds are long-term "
+                               "instruments — past returns don't guarantee future results.")
+
+                    # NAV history chart
+                    hist = _funds.get_mf_history(st.session_state.mf_selected)
+                    if hist is not None and not hist.empty:
+                        chart_df = hist.set_index("date")["nav"].tail(365)
+                        st.line_chart(chart_df, height=260)
+
+        with tab_compare:
+            clist = st.session_state.mf_compare_list
+            if not clist:
+                st.info("Add funds via the **Search & Track** tab → '➕ Add to Compare'.")
+            else:
+                st.markdown(f"##### Comparing {len(clist)} funds")
+                if st.button("🗑 Clear comparison"):
+                    st.session_state.mf_compare_list = []
+                    st.rerun()
+                with st.spinner("Building comparison…"):
+                    cmp_df = _funds.compare_mfs(clist)
+                if cmp_df is not None and not cmp_df.empty:
+                    st.dataframe(cmp_df, width="stretch", hide_index=True,
+                                 column_config={"Fund": st.column_config.TextColumn(pinned=True)})
+                    st.download_button(
+                        "⬇️ Export Comparison CSV",
+                        cmp_df.to_csv(index=False).encode("utf-8"),
+                        file_name=f"mf_compare_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                        mime="text/csv")
+
+# ── Position Sizing Calculator ─────────────────────────────────────────────────
+elif _page == 'sizing':
+    st.markdown('<div class="sec">🧮 Position Sizing Calculator</div>',
+                unsafe_allow_html=True)
+    st.caption("Risk-based position sizing — never lose more than your chosen % "
+               "on a single trade. This is the most important discipline in trading.")
+
+    colA, colB = st.columns(2)
+    with colA:
+        _cap = st.number_input("💰 Total Trading Capital ($)", min_value=1000.0,
+                               value=float(st.session_state.get("_sz_cap", 100000.0)),
+                               step=5000.0, key="sz_cap")
+        st.session_state._sz_cap = _cap
+        _risk_pct = st.slider("⚠️ Risk per Trade (%)", 0.25, 5.0,
+                              float(st.session_state.get("_sz_risk", 1.0)), 0.25,
+                              key="sz_risk",
+                              help="Pros risk 1-2% per trade. Never exceed 2% as a beginner.")
+        st.session_state._sz_risk = _risk_pct
+    with colB:
+        _entry = st.number_input("📈 Entry Price ($)", min_value=0.0,
+                                 value=float(st.session_state.get("_sz_entry", 100.0)),
+                                 step=1.0, key="sz_entry")
+        st.session_state._sz_entry = _entry
+        _stop = st.number_input("🛑 Stop Loss Price ($)", min_value=0.0,
+                                value=float(st.session_state.get("_sz_stop", 95.0)),
+                                step=1.0, key="sz_stop")
+        st.session_state._sz_stop = _stop
+
+    # Calculations
+    if _entry > 0 and _stop > 0 and _entry != _stop:
+        risk_amount = _cap * (_risk_pct / 100)          # max $ to lose
+        risk_per_share = abs(_entry - _stop)             # $ risk per share
+        qty = int(risk_amount / risk_per_share) if risk_per_share > 0 else 0
+        position_value = qty * _entry
+        position_pct = (position_value / _cap * 100) if _cap > 0 else 0
+        is_long = _stop < _entry
+        direction = "LONG" if is_long else "SHORT"
+
+        # Warnings
+        warn = ""
+        if position_value > _cap:
+            warn = ("⚠️ This position needs more capital than you have — "
+                    "your stop is too wide for this risk %. Widen the stop "
+                    "distance or lower risk %.")
+        elif position_pct > 50:
+            warn = (f"⚠️ This position is {position_pct:.0f}% of your capital — "
+                    "very concentrated. Consider a tighter stop or smaller risk %.")
+
+        st.markdown(f"""
+<div style="background:var(--card);border:1px solid var(--border);border-radius:12px;
+            padding:1.4rem 1.6rem;margin:1rem 0">
+  <div style="font-size:.75rem;color:var(--muted);text-transform:uppercase;
+              letter-spacing:.08em;margin-bottom:.8rem">{direction} Position</div>
+  <div style="display:flex;gap:2.5rem;flex-wrap:wrap">
+    <div><span style="color:var(--muted);font-size:.78rem">Shares to Buy</span><br>
+         <b style="font-size:1.8rem;color:var(--accent)">{qty:,}</b></div>
+    <div><span style="color:var(--muted);font-size:.78rem">Position Value</span><br>
+         <b style="font-size:1.5rem">${position_value:,.0f}</b>
+         <span style="font-size:.8rem;color:var(--muted)"> ({position_pct:.1f}%)</span></div>
+    <div><span style="color:var(--muted);font-size:.78rem">Max Loss (your risk)</span><br>
+         <b style="font-size:1.5rem;color:var(--red)">${risk_amount:,.0f}</b></div>
+    <div><span style="color:var(--muted);font-size:.78rem">Risk / Share</span><br>
+         <b style="font-size:1.5rem">${risk_per_share:.2f}</b></div>
+  </div>
+</div>""", unsafe_allow_html=True)
+        if warn:
+            st.warning(warn)
+
+        # Target calculator with R-multiples
+        st.markdown("##### 🎯 Target Levels (Risk:Reward)")
+        tcols = st.columns(4)
+        for i, rmult in enumerate([1, 2, 3, 5]):
+            if is_long:
+                tgt = _entry + rmult * risk_per_share
+            else:
+                tgt = _entry - rmult * risk_per_share
+            reward = qty * abs(tgt - _entry)
+            with tcols[i]:
+                st.markdown(f"""
+<div style="background:var(--card);border:1px solid var(--border);border-radius:8px;
+            padding:.7rem;text-align:center">
+  <div style="font-size:.7rem;color:var(--muted)">{rmult}R Target</div>
+  <div style="font-size:1.1rem;font-weight:800;color:var(--green)">${tgt:.2f}</div>
+  <div style="font-size:.72rem;color:var(--muted)">+${reward:,.0f}</div>
+</div>""", unsafe_allow_html=True)
+
+        st.caption("💡 Quantity is calculated so that IF your stop loss hits, you lose "
+                   "exactly your chosen risk amount — no more. This is how professionals "
+                   "size every trade.")
+    else:
+        st.info("Enter entry and stop loss prices (they must differ) to calculate sizing.")
+
+# ── Risk Dashboard ─────────────────────────────────────────────────────────────
+elif _page == 'risk':
+    st.markdown('<div class="sec">🛡 Portfolio Risk Dashboard</div>',
+                unsafe_allow_html=True)
+    st.caption("Portfolio-level risk exposure across all open positions.")
+
+    odf_risk = df[df["status"] == "Open"].copy() if not df.empty else pd.DataFrame()
+    if odf_risk.empty:
+        st.info("No open positions to analyze. Add trades to see your risk profile.")
+    else:
+        total_cap = st.number_input("💰 Total Trading Capital ($) — for risk context",
+                                    min_value=1000.0,
+                                    value=float(st.session_state.get("_sz_cap", 100000.0)),
+                                    step=5000.0, key="risk_cap")
+        st.session_state._sz_cap = total_cap
+
+        total_invested = odf_risk["invested"].sum()
+        total_current  = odf_risk["current_amt"].sum()
+        n_positions    = len(odf_risk)
+
+        # Concentration: largest position
+        odf_risk["pos_value"] = odf_risk["current_amt"]
+        largest = odf_risk.loc[odf_risk["pos_value"].idxmax()]
+        largest_pct = (largest["pos_value"] / total_current * 100) if total_current > 0 else 0
+
+        # Capital deployed
+        deployed_pct = (total_invested / total_cap * 100) if total_cap > 0 else 0
+
+        # Sector concentration
+        odf_risk["sector"] = odf_risk["stock"].apply(get_sector)
+        sector_exposure = odf_risk.groupby("sector")["pos_value"].sum()
+        top_sector = sector_exposure.idxmax() if not sector_exposure.empty else "—"
+        top_sector_pct = (sector_exposure.max() / total_current * 100) if total_current > 0 else 0
+
+        # Risk badges
+        def _risk_badge(value, warn_thresh, danger_thresh, reverse=False):
+            if reverse:
+                lvl = "danger" if value < danger_thresh else "warn" if value < warn_thresh else "ok"
+            else:
+                lvl = "danger" if value > danger_thresh else "warn" if value > warn_thresh else "ok"
+            clr = {"ok": "#10b981", "warn": "#f59e0b", "danger": "#ef4444"}[lvl]
+            return clr
+
+        m1, m2, m3, m4 = st.columns(4)
+        with m1:
+            clr = _risk_badge(deployed_pct, 80, 95)
+            st.markdown(f"""<div style="background:var(--card);border:1px solid var(--border);
+                border-radius:10px;padding:1rem;text-align:center">
+                <div style="font-size:.72rem;color:var(--muted)">Capital Deployed</div>
+                <div style="font-size:1.6rem;font-weight:800;color:{clr}">{deployed_pct:.0f}%</div>
+                <div style="font-size:.7rem;color:var(--muted)">${total_invested:,.0f}</div>
+                </div>""", unsafe_allow_html=True)
+        with m2:
+            clr = _risk_badge(largest_pct, 25, 40)
+            st.markdown(f"""<div style="background:var(--card);border:1px solid var(--border);
+                border-radius:10px;padding:1rem;text-align:center">
+                <div style="font-size:.72rem;color:var(--muted)">Largest Position</div>
+                <div style="font-size:1.6rem;font-weight:800;color:{clr}">{largest_pct:.0f}%</div>
+                <div style="font-size:.7rem;color:var(--muted)">{largest['stock']}</div>
+                </div>""", unsafe_allow_html=True)
+        with m3:
+            clr = _risk_badge(top_sector_pct, 40, 60)
+            st.markdown(f"""<div style="background:var(--card);border:1px solid var(--border);
+                border-radius:10px;padding:1rem;text-align:center">
+                <div style="font-size:.72rem;color:var(--muted)">Top Sector</div>
+                <div style="font-size:1.6rem;font-weight:800;color:{clr}">{top_sector_pct:.0f}%</div>
+                <div style="font-size:.7rem;color:var(--muted)">{top_sector}</div>
+                </div>""", unsafe_allow_html=True)
+        with m4:
+            st.markdown(f"""<div style="background:var(--card);border:1px solid var(--border);
+                border-radius:10px;padding:1rem;text-align:center">
+                <div style="font-size:.72rem;color:var(--muted)">Open Positions</div>
+                <div style="font-size:1.6rem;font-weight:800;color:var(--accent)">{n_positions}</div>
+                <div style="font-size:.7rem;color:var(--muted)">holdings</div>
+                </div>""", unsafe_allow_html=True)
+
+        # Sector exposure breakdown
+        st.markdown("##### 🥧 Sector Exposure")
+        sec_df = (sector_exposure / total_current * 100).round(1).reset_index()
+        sec_df.columns = ["Sector", "% of Portfolio"]
+        sec_df = sec_df.sort_values("% of Portfolio", ascending=False)
+        st.dataframe(sec_df, width="stretch", hide_index=True)
+
+        # Position-level risk table
+        st.markdown("##### 📊 Position Breakdown")
+        pos_df = odf_risk[["stock", "invested", "current_amt", "profit", "profit_pct"]].copy()
+        pos_df["% of Portfolio"] = (pos_df["current_amt"] / total_current * 100).round(1)
+        pos_df = pos_df.rename(columns={"stock": "Stock", "invested": "Invested",
+                                        "current_amt": "Current", "profit": "P&L",
+                                        "profit_pct": "P&L %"})
+        pos_df = pos_df.sort_values("% of Portfolio", ascending=False)
+        st.dataframe(pos_df, width="stretch", hide_index=True)
+
+        # Health summary
+        st.markdown("##### 🩺 Risk Health Check")
+        issues = []
+        if deployed_pct > 95:
+            issues.append("🔴 Nearly fully invested — no dry powder for opportunities or averaging.")
+        if largest_pct > 40:
+            issues.append(f"🔴 {largest['stock']} is {largest_pct:.0f}% of your portfolio — "
+                          "a single stock shock could badly hurt you.")
+        if top_sector_pct > 60:
+            issues.append(f"🔴 {top_sector} sector is {top_sector_pct:.0f}% of holdings — "
+                          "heavy concentration risk if that sector falls.")
+        if not issues:
+            st.success("✅ Portfolio risk looks reasonably balanced — no major concentration flags.")
+        else:
+            for i in issues:
+                st.warning(i)
+
+# ── Price Alerts ───────────────────────────────────────────────────────────────
+elif _page == 'alerts':
+    st.markdown('<div class="sec">🔔 Price Alerts</div>', unsafe_allow_html=True)
+    st.caption("Set price targets on any stock. Alerts trigger when crossed and "
+               "(if Telegram is configured) send you a message.")
+
+    with st.expander("➕ Create New Alert", expanded=True):
+        ac1, ac2, ac3 = st.columns([2, 1, 1])
+        with ac1:
+            _al_stock = st.text_input("Stock symbol (NSE)", key="al_stock",
+                                      placeholder="e.g. AAPL")
+        with ac2:
+            _al_cond = st.selectbox("Condition", ["above", "below"], key="al_cond")
+        with ac3:
+            _al_price = st.number_input("Target $", min_value=0.0, step=1.0, key="al_price")
+        _al_note = st.text_input("Note (optional)", key="al_note",
+                                 placeholder="e.g. breakout level / support")
+        if st.button("🔔 Create Alert", width="stretch"):
+            if _al_stock and _al_price > 0:
+                add_price_alert(UID, _al_stock, _al_cond, _al_price, _al_note)
+                st.success(f"Alert set: {_al_stock.upper()} {_al_cond} ${_al_price}")
+                st.rerun()
+            else:
+                st.error("Enter a stock symbol and a target price above 0.")
+
+    # Active alerts — check against live prices
+    active = get_price_alerts(UID, status="Active")
+    if active:
+        st.markdown(f"##### 🟢 Active Alerts ({len(active)})")
+        # Fetch current prices for all alert stocks
+        alert_syms = tuple(sorted({a[1] for a in active}))
+        alert_prices = _cached_prices(alert_syms)
+
+        for a in active:
+            aid, stock, cond, target, status, note, created, _ = a
+            cur_price = alert_prices.get(stock)
+            triggered = False
+            if cur_price is not None:
+                if cond == "above" and cur_price >= target:
+                    triggered = True
+                elif cond == "below" and cur_price <= target:
+                    triggered = True
+
+            cur_str = f"${cur_price}" if cur_price is not None else "—"
+            arrow = "▲" if cond == "above" else "▼"
+            row_clr = "#10b981" if triggered else "var(--border)"
+
+            cc1, cc2 = st.columns([5, 1])
+            with cc1:
+                trig_html = ('<span style="background:rgba(16,185,129,.2);color:#10b981;'
+                             'padding:.15rem .5rem;border-radius:4px;font-size:.7rem;'
+                             'font-weight:800;margin-left:.5rem">🎯 TRIGGERED</span>') if triggered else ''
+                st.markdown(f"""
+<div style="background:var(--card);border:1px solid {row_clr};border-radius:8px;
+            padding:.7rem 1rem;margin-bottom:.5rem">
+  <b style="font-size:.95rem">{stock}</b> {arrow} ${target}
+  <span style="color:var(--muted);font-size:.8rem">· now {cur_str}</span>{trig_html}
+  {('<br><span style="font-size:.72rem;color:var(--muted)">📝 ' + note + '</span>') if note else ''}
+</div>""", unsafe_allow_html=True)
+            with cc2:
+                if st.button("🗑", key=f"del_alert_{aid}"):
+                    delete_price_alert(aid, UID)
+                    st.rerun()
+
+            # If triggered, mark it + optionally send Telegram
+            if triggered:
+                trigger_price_alert(aid, UID)
+                if saved_tok and saved_cid:
+                    try:
+                        send_telegram(saved_tok, saved_cid,
+                            f"🎯 <b>PRICE ALERT</b>\n{stock} is now {cur_str} "
+                            f"({arrow} target ${target})\n{note}")
+                    except Exception:
+                        pass
+    else:
+        st.info("No active alerts. Create one above.")
+
+    # Triggered history
+    triggered_alerts = get_price_alerts(UID, status="Triggered")
+    if triggered_alerts:
+        with st.expander(f"📜 Triggered History ({len(triggered_alerts)})"):
+            for a in triggered_alerts:
+                aid, stock, cond, target, status, note, created, trig_date = a
+                arrow = "▲" if cond == "above" else "▼"
+                tc1, tc2 = st.columns([5, 1])
+                with tc1:
+                    st.markdown(f"**{stock}** {arrow} ${target} · triggered {trig_date or '—'}")
+                with tc2:
+                    if st.button("🗑", key=f"del_trig_{aid}"):
+                        delete_price_alert(aid, UID)
+                        st.rerun()
+
+# ── Stock Candlestick Chart ────────────────────────────────────────────────────
+elif _page == 'chart':
+    st.markdown('<div class="sec">📈 Stock Chart</div>', unsafe_allow_html=True)
+    st.caption("Candlestick chart with EMAs, Bollinger Bands, and support/resistance. "
+               "Pick a holding, watchlist stock, or type any US symbol.")
+
+    # Build symbol options: holdings + watchlist + manual
+    hold_syms = sorted(df["stock"].unique().tolist()) if not df.empty else []
+    try:
+        wl = get_watchlist(UID)
+        wl_syms = sorted(wl["stock"].unique().tolist()) if (wl is not None and not wl.empty) else []
+    except Exception:
+        wl_syms = []
+    combined = sorted(set(hold_syms + wl_syms))
+
+    cc1, cc2, cc3 = st.columns([2, 1, 1])
+    with cc1:
+        if combined:
+            _picked = st.selectbox("Your stocks", ["— type below —"] + combined, key="chart_pick")
+        else:
+            _picked = "— type below —"
+    with cc2:
+        _typed = st.text_input("Or US symbol", key="chart_typed", placeholder="e.g. AAPL")
+    with cc3:
+        _tf_label = st.selectbox("Timeframe", list(_CHART_TIMEFRAMES.keys()),
+                                 index=3, key="chart_tf")
+    _period, _interval = _CHART_TIMEFRAMES[_tf_label]
+
+    chart_sym = (_typed.strip().upper() if _typed.strip()
+                 else (_picked if _picked != "— type below —" else None))
+
+    if not chart_sym:
+        st.info("Select or type a stock symbol to view its chart.")
+    else:
+        with st.spinner(f"Loading {chart_sym} {_tf_label} chart…"):
+            cdf = fetch_chart_data(chart_sym, _period, _interval)
+            # Live CMP (real-time last price, same source as portfolio)
+            live_cmp = None
+            try:
+                _lp = _cached_prices((chart_sym,))
+                live_cmp = _lp.get(chart_sym)
+            except Exception:
+                pass
+
+        if cdf is None or cdf.empty or len(cdf) < 5:
+            st.error(f"Couldn't load {_tf_label} data for {chart_sym}. "
+                     f"Intraday data may be unavailable (markets closed / newly listed), "
+                     f"or Yahoo is rate-limited. Try the Daily timeframe.")
+        else:
+            c = cdf.copy()
+            # Indicators for overlay
+            close = c["Close"]
+            _ema_fast = 20 if len(c) >= 20 else max(2, len(c) // 2)
+            _ema_slow = 50 if len(c) >= 50 else max(3, len(c) // 2)
+            c["EMA20"] = close.ewm(span=_ema_fast, adjust=False).mean()
+            c["EMA50"] = close.ewm(span=_ema_slow, adjust=False).mean()
+            _bb_win = min(20, len(c))
+            bb_mid = close.rolling(_bb_win).mean()
+            bb_std = close.rolling(_bb_win).std()
+            c["BB_up"] = bb_mid + 2 * bb_std
+            c["BB_dn"] = bb_mid - 2 * bb_std
+            support = float(c["Low"].rolling(min(20, len(c))).min().iloc[-1])
+            resistance = float(c["High"].rolling(min(20, len(c))).max().iloc[-1])
+
+            fig = go.Figure()
+            # Bollinger band fill
+            fig.add_trace(go.Scatter(x=c.index, y=c["BB_up"], line=dict(width=0),
+                                     showlegend=False, hoverinfo="skip"))
+            fig.add_trace(go.Scatter(x=c.index, y=c["BB_dn"], line=dict(width=0),
+                                     fill="tonexty", fillcolor="rgba(120,120,200,0.08)",
+                                     showlegend=False, hoverinfo="skip", name="BB"))
+            # Candles
+            fig.add_trace(go.Candlestick(
+                x=c.index, open=c["Open"], high=c["High"], low=c["Low"], close=c["Close"],
+                name=chart_sym, increasing_line_color="#10b981",
+                decreasing_line_color="#ef4444"))
+            # EMAs
+            fig.add_trace(go.Scatter(x=c.index, y=c["EMA20"],
+                                     line=dict(color="#f59e0b", width=1.3),
+                                     name=f"EMA {_ema_fast}"))
+            fig.add_trace(go.Scatter(x=c.index, y=c["EMA50"],
+                                     line=dict(color="#3b82f6", width=1.3),
+                                     name=f"EMA {_ema_slow}"))
+            # S/R lines
+            fig.add_hline(y=resistance, line=dict(color="#ef4444", width=1, dash="dash"),
+                          annotation_text=f"R ${resistance:.1f}", annotation_position="right")
+            fig.add_hline(y=support, line=dict(color="#10b981", width=1, dash="dash"),
+                          annotation_text=f"S ${support:.1f}", annotation_position="right")
+            # Live CMP line (real-time, distinct from last candle close)
+            if live_cmp:
+                fig.add_hline(y=live_cmp, line=dict(color="#d4af37", width=1.2, dash="dot"),
+                              annotation_text=f"CMP ${live_cmp:.1f}",
+                              annotation_position="left")
+
+            fig.update_layout(
+                height=520, margin=dict(l=10, r=10, t=30, b=10),
+                dragmode="pan",   # drag = pan (smooth), not the clunky zoom-box default
+                xaxis_rangeslider_visible=True,   # bottom mini-slider for left/right scroll
+                xaxis_rangeslider_thickness=0.06,
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                font=dict(color=theme_t.get("text", "#fff")),
+                legend=dict(orientation="h", yanchor="bottom", y=1.0, x=0),
+                hovermode="x unified")
+            fig.update_xaxes(gridcolor="rgba(255,255,255,0.05)", rangeslider_thickness=0.06)
+            fig.update_yaxes(gridcolor="rgba(255,255,255,0.05)", fixedrange=False)
+            _chart_config = {
+                "scrollZoom": True,        # mouse wheel / pinch zoom — smooth in/out
+                "displaylogo": False,
+                "modeBarButtonsToRemove": ["lasso2d", "select2d"],
+                "doubleClick": "autosize", # double-click resets zoom
+            }
+            st.plotly_chart(fig, use_container_width=True, config=_chart_config)
+
+            # Volume chart below — x-axis matched to price chart range for sync scroll
+            vfig = go.Figure()
+            vol_clr = ["#10b981" if c["Close"].iloc[i] >= c["Open"].iloc[i]
+                       else "#ef4444" for i in range(len(c))]
+            vfig.add_trace(go.Bar(x=c.index, y=c["Volume"], marker_color=vol_clr,
+                                  name="Volume"))
+            vfig.update_layout(height=160, margin=dict(l=10, r=10, t=10, b=10),
+                               dragmode="pan",
+                               paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                               font=dict(color=theme_t.get("text", "#fff")), showlegend=False)
+            vfig.update_xaxes(gridcolor="rgba(255,255,255,0.05)",
+                              range=[c.index[0], c.index[-1]])
+            vfig.update_yaxes(gridcolor="rgba(255,255,255,0.05)")
+            st.plotly_chart(vfig, use_container_width=True, config=_chart_config)
+            st.caption("🖱️ Scroll to zoom · Drag to pan · Double-click to reset · "
+                       "Use the slider strip below the chart to jump left/right")
+
+            # Quick stats row — lead with LIVE CMP, not stale candle close
+            last_close = float(c["Close"].iloc[-1])
+            prev_close = float(c["Close"].iloc[-2]) if len(c) >= 2 else last_close
+            display_price = live_cmp if live_cmp else last_close
+            chg = (display_price / prev_close - 1) * 100 if prev_close else 0
+            sc1, sc2, sc3, sc4 = st.columns(4)
+            sc1.metric("CMP (live)" if live_cmp else "Last Close",
+                       f"${display_price:.2f}", f"{chg:+.2f}%")
+            sc2.metric("Support", f"${support:.2f}")
+            sc3.metric("Resistance", f"${resistance:.2f}")
+            sc4.metric("Bars", f"{len(c)}")
+            if live_cmp and abs(live_cmp - last_close) > 0.01:
+                st.caption(f"💡 Gold dotted line = live CMP ${live_cmp:.2f}. "
+                           f"Last {_tf_label} candle closed at ${last_close:.2f} "
+                           f"(candles lag live price, especially intraday/after-hours).")
+
+# ── Trade Journal ──────────────────────────────────────────────────────────────
+elif _page == 'journal':
+    st.markdown('<div class="sec">📓 Trade Journal</div>', unsafe_allow_html=True)
+    st.caption("Log why you entered each trade and what you learned. Over time this "
+               "becomes your most valuable asset — you'll spot patterns in your own decisions.")
+
+    with st.expander("➕ New Journal Entry", expanded=False):
+        jc1, jc2, jc3 = st.columns(3)
+        with jc1:
+            j_stock = st.text_input("Stock", key="j_stock", placeholder="AAPL")
+            j_date = st.date_input("Trade date", key="j_date")
+            j_dir = st.selectbox("Direction", ["Long", "Short"], key="j_dir")
+        with jc2:
+            j_entry = st.number_input("Entry $", min_value=0.0, step=1.0, key="j_entry")
+            j_exit = st.number_input("Exit $ (0 if open)", min_value=0.0, step=1.0, key="j_exit")
+            j_setup = st.selectbox("Setup", ["Breakout", "Pullback", "Reversal", "Trend-follow",
+                                   "SMC / Order Block", "Trap reversal", "Sector rotation",
+                                   "News-based", "Other"], key="j_setup")
+        with jc3:
+            j_emotion = st.selectbox("Emotion at entry", ["Confident", "Neutral", "FOMO",
+                                     "Fearful", "Greedy", "Revenge", "Disciplined"], key="j_emotion")
+            j_outcome = st.selectbox("Outcome", ["Open", "Win", "Loss", "Breakeven"], key="j_outcome")
+            j_rating = st.slider("Execution rating", 1, 5, 3, key="j_rating",
+                                 help="How well did you follow your plan? (not P&L)")
+        j_rationale = st.text_area("Why did you enter? (your thesis)", key="j_rationale",
+                                   placeholder="e.g. broke 200-DMA on volume, sector rotating in…")
+        j_lesson = st.text_area("Lesson learned / notes", key="j_lesson",
+                                placeholder="e.g. exited too early out of fear, should have trusted the stop")
+        if st.button("💾 Save Entry", width="stretch"):
+            if j_stock:
+                add_journal_entry(UID, j_stock, str(j_date), j_dir, j_entry,
+                                  j_exit if j_exit > 0 else None, j_setup, j_rationale,
+                                  j_emotion, j_outcome, j_lesson, j_rating)
+                st.success(f"Journal entry saved for {j_stock.upper()}")
+                st.rerun()
+            else:
+                st.error("Enter at least a stock symbol.")
+
+    entries = get_journal_entries(UID)
+    if not entries:
+        st.info("No journal entries yet. Log your first trade above — your future self will thank you.")
+    else:
+        # Insight summary
+        wins = sum(1 for e in entries if e[9] == "Win")
+        losses = sum(1 for e in entries if e[9] == "Loss")
+        closed = wins + losses
+        avg_rating = sum(e[11] or 0 for e in entries) / len(entries) if entries else 0
+        # Most common setup & emotion
+        from collections import Counter
+        setups = Counter(e[6] for e in entries if e[6])
+        emotions = Counter(e[8] for e in entries if e[8])
+        top_setup = setups.most_common(1)[0][0] if setups else "—"
+        top_emotion = emotions.most_common(1)[0][0] if emotions else "—"
+
+        ic1, ic2, ic3, ic4 = st.columns(4)
+        ic1.metric("Entries", len(entries))
+        ic2.metric("Win Rate", f"{(wins/closed*100):.0f}%" if closed else "—",
+                   f"{wins}W / {losses}L")
+        ic3.metric("Avg Execution", f"{avg_rating:.1f}/5")
+        ic4.metric("Top Setup", top_setup)
+
+        # Win rate by setup — the real insight
+        st.markdown("##### 📊 Win Rate by Setup")
+        setup_stats = {}
+        for e in entries:
+            s, oc = e[6], e[9]
+            if oc in ("Win", "Loss"):
+                setup_stats.setdefault(s, {"w": 0, "l": 0})
+                setup_stats[s]["w" if oc == "Win" else "l"] += 1
+        if setup_stats:
+            rows = []
+            for s, st_ in setup_stats.items():
+                tot = st_["w"] + st_["l"]
+                wr = st_["w"] / tot * 100 if tot else 0
+                rows.append({"Setup": s, "Trades": tot, "Wins": st_["w"],
+                             "Losses": st_["l"], "Win %": round(wr, 0)})
+            sdf = pd.DataFrame(rows).sort_values("Win %", ascending=False)
+            st.dataframe(sdf, width="stretch", hide_index=True)
+            st.caption("💡 Focus on the setups where you actually win. Cut the ones that lose.")
+
+        # Entry cards
+        st.markdown("##### 📒 Entries")
+        for e in entries:
+            (jid, stock, tdate, direction, entry_p, exit_p, setup, rationale,
+             emotion, outcome, lesson, rating, created) = e
+            oc_clr = {"Win": "#10b981", "Loss": "#ef4444",
+                      "Breakeven": "#f59e0b", "Open": "#8e8e93"}.get(outcome, "#8e8e93")
+            pnl_str = ""
+            if entry_p and exit_p:
+                pnl = ((exit_p / entry_p - 1) * 100) if direction == "Long" else ((entry_p / exit_p - 1) * 100)
+                pnl_str = f" · {pnl:+.1f}%"
+            jcol1, jcol2 = st.columns([6, 1])
+            with jcol1:
+                st.markdown(f"""
+<div style="background:var(--card);border:1px solid var(--border);border-left:3px solid {oc_clr};
+            border-radius:8px;padding:.8rem 1rem;margin-bottom:.6rem">
+  <div style="display:flex;justify-content:space-between;flex-wrap:wrap">
+    <b style="font-size:.95rem">{stock} <span style="color:var(--muted);font-weight:400">
+       {direction} · {setup}</span></b>
+    <span style="color:{oc_clr};font-weight:700;font-size:.85rem">{outcome}{pnl_str}</span>
+  </div>
+  <div style="font-size:.78rem;color:var(--muted);margin-top:.2rem">
+    {tdate} · Entry ${entry_p or '—'} → Exit ${exit_p or '—'} · Emotion: {emotion} · ⭐{rating}/5</div>
+  {('<div style="font-size:.82rem;margin-top:.4rem"><b>Thesis:</b> ' + rationale + '</div>') if rationale else ''}
+  {('<div style="font-size:.82rem;margin-top:.3rem;color:var(--accent)"><b>Lesson:</b> ' + lesson + '</div>') if lesson else ''}
+</div>""", unsafe_allow_html=True)
+            with jcol2:
+                if st.button("🗑", key=f"del_journal_{jid}"):
+                    delete_journal_entry(jid, UID)
+                    st.rerun()
+
+# ── Market Breadth ─────────────────────────────────────────────────────────────
+elif _page == 'breadth':
+    st.markdown('<div class="sec">📊 Market Breadth</div>', unsafe_allow_html=True)
+    st.caption("Overall market health from the universe scan. Strong breadth = broad "
+               "participation (safer for longs). Weak breadth = narrow/risky market.")
+
+    scan_df = st.session_state.get("scanner_cache")
+    if scan_df is None or (hasattr(scan_df, "empty") and scan_df.empty):
+        st.info("Breadth needs universe scan data. Click below to run it "
+                "(or it fills automatically via the background deep scan).")
+        if st.button("🔍 Run Universe Scan for Breadth"):
+            with st.spinner("Scanning universe…"):
+                st.session_state.scanner_cache = generate_market_scanner()
+            st.rerun()
+    else:
+        total = len(scan_df)
+        # Breadth metrics from scanner columns
+        uptrend = len(scan_df[scan_df["Trend"].isin(["Uptrend", "Strong Uptrend"])])
+        downtrend = len(scan_df[scan_df["Trend"].isin(["Downtrend", "Strong Downtrend"])])
+        bullish_pct = round(uptrend / total * 100, 1) if total else 0
+        bearish_pct = round(downtrend / total * 100, 1) if total else 0
+        # RSI-based
+        overbought = len(scan_df[scan_df["RSI"] >= 70])
+        oversold = len(scan_df[scan_df["RSI"] <= 30])
+        # Signal distribution
+        strong_buy = len(scan_df[scan_df["Signal"].str.contains("STRONG BUY", na=False)])
+        avoid = len(scan_df[scan_df["Signal"].str.contains("AVOID", na=False)])
+
+        # Overall breadth verdict
+        if bullish_pct >= 60:
+            verdict, vclr = "STRONG — broad participation, favorable for longs", "#10b981"
+        elif bullish_pct >= 40:
+            verdict, vclr = "NEUTRAL — mixed market, be selective", "#f59e0b"
+        else:
+            verdict, vclr = "WEAK — narrow market, longs carry extra risk", "#ef4444"
+
+        st.markdown(f"""
+<div style="background:var(--card);border:1px solid {vclr};border-radius:12px;
+            padding:1.2rem 1.5rem;margin:.5rem 0">
+  <div style="font-size:.75rem;color:var(--muted);text-transform:uppercase;
+              letter-spacing:.08em">Market Breadth Verdict</div>
+  <div style="font-size:1.2rem;font-weight:800;color:{vclr};margin-top:.3rem">{verdict}</div>
+  <div style="font-size:.8rem;color:var(--muted);margin-top:.3rem">
+       Based on {total:,} liquid stocks scanned</div>
+</div>""", unsafe_allow_html=True)
+
+        b1, b2, b3, b4 = st.columns(4)
+        b1.metric("🟢 In Uptrend", f"{bullish_pct}%", f"{uptrend} stocks")
+        b2.metric("🔴 In Downtrend", f"{bearish_pct}%", f"{downtrend} stocks")
+        b3.metric("⚠️ Overbought (RSI≥70)", overbought)
+        b4.metric("💧 Oversold (RSI≤30)", oversold)
+
+        # Advance/decline style bar
+        st.markdown("##### 📈 Trend Distribution")
+        trend_counts = scan_df["Trend"].value_counts()
+        tfig = go.Figure(go.Bar(
+            x=trend_counts.values, y=trend_counts.index, orientation="h",
+            marker_color=["#10b981" if "Up" in str(t) else "#ef4444" if "Down" in str(t)
+                          else "#8e8e93" for t in trend_counts.index]))
+        tfig.update_layout(height=280, margin=dict(l=10, r=10, t=10, b=10),
+                           paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                           font=dict(color=theme_t.get("text", "#fff")))
+        tfig.update_xaxes(gridcolor="rgba(255,255,255,0.05)")
+        st.plotly_chart(tfig, use_container_width=True)
+
+        # Sector breadth
+        st.markdown("##### 🏭 Sector Breadth (% of sector in uptrend)")
+        sec_breadth = []
+        for sec in scan_df["Sector"].unique():
+            sub = scan_df[scan_df["Sector"] == sec]
+            up = len(sub[sub["Trend"].isin(["Uptrend", "Strong Uptrend"])])
+            pct = round(up / len(sub) * 100, 0) if len(sub) else 0
+            sec_breadth.append({"Sector": sec, "Stocks": len(sub),
+                                "In Uptrend": up, "Bullish %": pct})
+        sb_df = pd.DataFrame(sec_breadth).sort_values("Bullish %", ascending=False)
+        st.dataframe(sb_df, width="stretch", hide_index=True)
+        st.caption("💡 Sectors at the top have the strongest internal breadth — "
+                   "where the buying is concentrated right now.")
+
+# ── Custom Screener ────────────────────────────────────────────────────────────
+elif _page == 'screener':
+    st.markdown('<div class="sec">🔬 Custom Screener</div>', unsafe_allow_html=True)
+    st.caption("Filter the universe by your own criteria. Runs on the latest universe "
+               "scan data (no extra fetch needed).")
+
+    scan_df = st.session_state.get("scanner_cache")
+    if scan_df is None or (hasattr(scan_df, "empty") and scan_df.empty):
+        st.info("Screener needs universe scan data first.")
+        if st.button("🔍 Run Universe Scan"):
+            with st.spinner("Scanning universe…"):
+                st.session_state.scanner_cache = generate_market_scanner()
+            st.rerun()
+    else:
+        st.markdown(f"##### Filters ({len(scan_df):,} stocks in universe)")
+        f1, f2, f3 = st.columns(3)
+        with f1:
+            rsi_range = st.slider("RSI range", 0, 100, (40, 70), key="scr_rsi")
+            min_score = st.slider("Min signal score", -10, 20, 2, key="scr_score")
+        with f2:
+            trend_filter = st.multiselect(
+                "Trend", ["Strong Uptrend", "Uptrend", "Sideways",
+                          "Downtrend", "Strong Downtrend", "Recovery"],
+                default=["Strong Uptrend", "Uptrend"], key="scr_trend")
+            min_turnover = st.number_input("Min $ turnover (M)", 0.0, 5000.0, 5.0,
+                                           key="scr_turnover")
+        with f3:
+            sectors_avail = sorted(scan_df["Sector"].unique().tolist())
+            sector_filter = st.multiselect("Sectors (blank = all)", sectors_avail,
+                                           default=[], key="scr_sector")
+            signal_filter = st.multiselect(
+                "Signal", ["🔥 STRONG BUY", "🟢 BUY SETUP", "🟡 ACCUMULATE",
+                           "⚪ NEUTRAL", "🔴 AVOID"],
+                default=[], key="scr_signal")
+
+        # Apply filters
+        res = scan_df.copy()
+        res = res[(res["RSI"] >= rsi_range[0]) & (res["RSI"] <= rsi_range[1])]
+        res = res[res["Score"] >= min_score]
+        if trend_filter:
+            res = res[res["Trend"].isin(trend_filter)]
+        if "Turnover_M" in res.columns:
+            res = res[res["Turnover_M"] >= min_turnover]
+        if sector_filter:
+            res = res[res["Sector"].isin(sector_filter)]
+        if signal_filter:
+            res = res[res["Signal"].isin(signal_filter)]
+
+        st.markdown(f"##### 🎯 {len(res)} matches")
+        if res.empty:
+            st.warning("No stocks match these filters. Try loosening them.")
+        else:
+            show_cols = ["Stock", "Sector", "Signal", "Score", "CMP", "RSI",
+                         "Trend", "VCP", "Trap", "RS", "Entry", "Target", "SL", "Turnover_M"]
+            show_cols = [c for c in show_cols if c in res.columns]
+            res_show = res[show_cols].sort_values("Score", ascending=False)
+            _h = min(max(len(res_show) * 36 + 40, 200), 600)
+            st.dataframe(res_show, width="stretch", height=_h, hide_index=True,
+                         column_config={"Stock": st.column_config.TextColumn(pinned=True)})
+            st.download_button(
+                "⬇️ Export Screener Results CSV",
+                res_show.to_csv(index=False).encode("utf-8"),
+                file_name=f"screener_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                mime="text/csv")
+
+# ── Earnings Calendar ──────────────────────────────────────────────────────────
+elif _page == 'earnings':
+    st.markdown('<div class="sec">📆 Earnings Calendar</div>', unsafe_allow_html=True)
+    st.caption("Upcoming results & key dates for your holdings. Helps you avoid being "
+               "caught holding through a risky earnings event.")
+
+    if df.empty:
+        st.info("Add holdings to see their upcoming earnings dates.")
+    else:
+        hold_syms = sorted(df[df["status"] == "Open"]["stock"].unique().tolist())
+        if not hold_syms:
+            st.info("No open positions. Earnings calendar tracks your active holdings.")
+        else:
+            if st.button("📅 Fetch Earnings Dates", width="stretch"):
+                import yfinance as _yf
+                rows = []
+                prog = st.progress(0.0)
+                for i, sym in enumerate(hold_syms):
+                    try:
+                        t = _yf.Ticker(sym)
+                        cal = None
+                        try:
+                            cal = t.calendar
+                        except Exception:
+                            cal = None
+                        edate = None
+                        if isinstance(cal, dict):
+                            ev = cal.get("Earnings Date")
+                            if ev:
+                                edate = ev[0] if isinstance(ev, list) else ev
+                        elif cal is not None and hasattr(cal, "loc"):
+                            try:
+                                edate = cal.loc["Earnings Date"][0]
+                            except Exception:
+                                edate = None
+                        rows.append({"Stock": sym,
+                                     "Next Earnings": str(edate)[:10] if edate else "—"})
+                    except Exception:
+                        rows.append({"Stock": sym, "Next Earnings": "—"})
+                    prog.progress((i + 1) / len(hold_syms))
+                prog.empty()
+                st.session_state._earnings_cache = pd.DataFrame(rows)
+
+            ecache = st.session_state.get("_earnings_cache")
+            if ecache is not None and not ecache.empty:
+                st.dataframe(ecache, width="stretch", hide_index=True)
+                st.caption("⚠️ Earnings dates from Yahoo can be estimates and aren't "
+                           "always available for every NSE stock. Verify with the "
+                           "company / exchange before trading around results.")
+            else:
+                st.info("Click **Fetch Earnings Dates** to load upcoming results for "
+                        "your holdings.")
+
+# ── IPO Tracker ────────────────────────────────────────────────────────────────
+elif _page == 'ipo':
+    st.markdown('<div class="sec">🆕 IPO Tracker</div>', unsafe_allow_html=True)
+    st.caption("Recently listed stocks and their performance since listing.")
+
+    st.info("📌 **Honest note:** Reliable free IPO/GMP data is hard to get "
+            "programmatically (NSE blocks cloud IPs; GMP sources are unofficial). "
+            "This tracker lets you manually add stocks you're watching and tracks "
+            "their performance via Yahoo once they're listed.")
+
+    # Manual IPO watchlist using a session list
+    if "_ipo_watch" not in st.session_state:
+        st.session_state._ipo_watch = []
+
+    ic1, ic2 = st.columns([3, 1])
+    with ic1:
+        _ipo_sym = st.text_input("Add newly listed stock (US symbol)", key="ipo_sym",
+                                 placeholder="e.g. NVDA")
+    with ic2:
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("➕ Track", width="stretch"):
+            if _ipo_sym and _ipo_sym.upper() not in st.session_state._ipo_watch:
+                st.session_state._ipo_watch.append(_ipo_sym.upper().strip())
+                st.rerun()
+
+    if st.session_state._ipo_watch:
+        if st.button("🔄 Refresh IPO Performance"):
+            st.session_state._ipo_refresh = True
+
+        rows = []
+        for sym in st.session_state._ipo_watch:
+            try:
+                hist = fetch_chart_data(sym, "1mo", "1d")
+                if hist is not None and not hist.empty:
+                    listing_price = float(hist["Open"].iloc[0])
+                    cur = float(hist["Close"].iloc[-1])
+                    # live CMP if available
+                    try:
+                        lp = _cached_prices((sym,)).get(sym)
+                        if lp: cur = lp
+                    except Exception:
+                        pass
+                    chg = (cur / listing_price - 1) * 100 if listing_price else 0
+                    rows.append({"Stock": sym, "Listing ~Price": round(listing_price, 2),
+                                 "CMP": round(cur, 2), "Since Listing %": round(chg, 1),
+                                 "Days": len(hist)})
+                else:
+                    rows.append({"Stock": sym, "Listing ~Price": "—", "CMP": "—",
+                                 "Since Listing %": "—", "Days": 0})
+            except Exception:
+                rows.append({"Stock": sym, "Listing ~Price": "—", "CMP": "—",
+                             "Since Listing %": "—", "Days": 0})
+
+        ipo_df = pd.DataFrame(rows)
+        st.dataframe(ipo_df, width="stretch", hide_index=True)
+
+        # Remove option
+        _rm = st.selectbox("Remove from tracker", ["—"] + st.session_state._ipo_watch,
+                           key="ipo_rm")
+        if _rm != "—" and st.button("🗑 Remove"):
+            st.session_state._ipo_watch.remove(_rm)
+            st.rerun()
+        st.caption("💡 'Listing ~Price' is the first available open from Yahoo, which "
+                   "approximates the listing-day open. Newly listed stocks need ~20 "
+                   "trading days before full technical signals work (see Active Signals).")
+    else:
+        st.info("Add a recently listed stock above to start tracking its performance.")
+
+# ── VCP Scanner ────────────────────────────────────────────────────────────────
+elif _page == 'vcp':
+    st.markdown('<div class="sec">📐 VCP Scanner — Volatility Contraction Pattern</div>',
+                unsafe_allow_html=True)
+    st.caption("Minervini's VCP: a leader basing through progressively tighter pullbacks "
+               "with volume drying up, coiled under a pivot. Ready bases are near breakout.")
+
+    if scan_for_vcp is None:
+        st.warning("⚠️ VCP scanner not available — make sure the latest `signals.py` is deployed.")
+    else:
+        vc1, vc2, vc3 = st.columns([1, 1, 1])
+        with vc1:
+            _vcp_quality = st.selectbox("Min base quality", ["C", "B", "A", "A+"],
+                                        index=1, key="vcp_q")
+        with vc2:
+            _vcp_ready = st.checkbox("Pivot-ready only", value=False, key="vcp_ready_only",
+                                     help="Only bases coiled right under the breakout pivot")
+        with vc3:
+            st.markdown("<br>", unsafe_allow_html=True)
+            _run_vcp = st.button("🔍 Scan for VCP", width="stretch")
+
+        if _run_vcp:
+            with st.spinner("Scanning universe for VCP bases… (this can take a minute)"):
+                st.session_state.vcp_scan_cache = scan_for_vcp(
+                    min_quality=_vcp_quality, ready_only=_vcp_ready)
+
+        vres = st.session_state.get("vcp_scan_cache")
+        if vres is None:
+            st.info("Click **Scan for VCP** to find contraction bases across the universe.")
+        elif not vres.get("vcp_setups"):
+            st.warning(f"No VCP bases found at {_vcp_quality}+ quality. "
+                       f"Scanned {vres.get('liquid',0)} liquid stocks. "
+                       "Try lowering the quality filter or unchecking pivot-ready.")
+        else:
+            setups = vres["vcp_setups"]
+            st.markdown(f"##### 🎯 {len(setups)} VCP bases "
+                        f"({vres.get('ready_count',0)} pivot-ready) · "
+                        f"scanned {vres.get('liquid',0)} liquid stocks")
+
+            # ── Top 5 candidates card (already ranked: ready first, then quality) ──
+            top5 = setups[:5]
+            if top5:
+                cards = ""
+                for i, s in enumerate(top5, 1):
+                    rdy = "⚡" if s["vcp_ready"] else ""
+                    cards += (
+                        f'<div style="display:flex;justify-content:space-between;'
+                        f'padding:.5rem .7rem;border-bottom:1px solid var(--border)">'
+                        f'<span><b style="color:var(--accent)">{i}.</b> '
+                        f'<b>{s["stock"]}</b> {rdy} '
+                        f'<span style="color:var(--muted);font-size:.78rem">{s["sector"]}</span></span>'
+                        f'<span style="font-family:monospace;font-size:.82rem">'
+                        f'VCP {s["quality"]} · pivot ${s["pivot"]} '
+                        f'({s.get("pivot_distance_pct",0):+.1f}%)</span></div>')
+                st.markdown(
+                    f'<div style="background:var(--gradient);border:1px solid var(--accent);'
+                    f'border-radius:12px;padding:1rem 1.2rem;margin-bottom:1.2rem">'
+                    f'<div style="font-size:.8rem;font-weight:800;color:var(--accent);'
+                    f'text-transform:uppercase;letter-spacing:.06em;margin-bottom:.5rem">'
+                    f'⭐ Top 5 Candidates to Research</div>{cards}'
+                    f'<div style="font-size:.72rem;color:var(--muted);margin-top:.6rem">'
+                    f'Ranked: pivot-ready first, then base quality. These are research '
+                    f'candidates — confirm the breakout above pivot before entering.</div>'
+                    f'</div>', unsafe_allow_html=True)
+
+            for s in setups:
+                q = s["quality"]
+                q_clr = {"A+": "#10b981", "A": "#22c55e",
+                         "B": "#f59e0b", "C": "#8e8e93"}.get(q, "#8e8e93")
+                ready_badge = ('<span style="background:rgba(16,185,129,.2);color:#10b981;'
+                               'padding:.15rem .5rem;border-radius:5px;font-size:.7rem;'
+                               'font-weight:800;margin-left:.5rem">⚡ PIVOT-READY</span>'
+                               if s["vcp_ready"] else '')
+                contractions_str = " → ".join(f"-{x}%" for x in s.get("contractions", []))
+                rr_str = f"1:{s['risk_reward']}" if s.get("risk_reward") else "—"
+                st.markdown(f"""
+<div style="background:var(--card);border:1px solid var(--border);
+            border-left:3px solid {q_clr};border-radius:10px;
+            padding:1rem 1.2rem;margin-bottom:.7rem">
+  <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:.4rem">
+    <div>
+      <b style="font-size:1.02rem">{s['stock']}</b>
+      <span style="color:var(--muted);font-size:.78rem;margin-left:.4rem">{s['sector']}</span>
+      <span style="background:{q_clr}22;color:{q_clr};padding:.12rem .5rem;border-radius:5px;
+            font-size:.72rem;font-weight:800;margin-left:.5rem">VCP {q}</span>{ready_badge}
+    </div>
+    <div style="font-family:'JetBrains Mono',monospace;font-size:.82rem;color:var(--muted)">
+      CMP ${s['cmp']} · Pivot ${s['pivot']}
+    </div>
+  </div>
+  <div style="font-size:.82rem;color:var(--muted);margin-top:.5rem">
+    📉 Contractions: <b style="color:var(--text)">{contractions_str}</b>
+    &nbsp;·&nbsp; {s.get('detail','')}
+  </div>
+  <div style="font-size:.85rem;margin-top:.5rem">
+    <b>Entry</b> ${s.get('entry','—')} &nbsp;·&nbsp;
+    <b>Target</b> ${s.get('target','—')} &nbsp;·&nbsp;
+    <b>Stop</b> ${s.get('stop_loss','—')} &nbsp;·&nbsp;
+    <b>R:R</b> {rr_str}
+  </div>
+</div>""", unsafe_allow_html=True)
+
+            # CSV export
+            import pandas as _pd
+            exp_df = _pd.DataFrame([{
+                "Stock": s["stock"], "Sector": s["sector"], "Quality": s["quality"],
+                "Ready": s["vcp_ready"], "CMP": s["cmp"], "Pivot": s["pivot"],
+                "Pivot Dist %": s.get("pivot_distance_pct"),
+                "Contractions": " → ".join(f"-{x}%" for x in s.get("contractions", [])),
+                "Entry": s.get("entry"), "Target": s.get("target"),
+                "Stop": s.get("stop_loss"), "R:R": s.get("risk_reward"),
+            } for s in setups])
+            st.download_button(
+                "⬇️ Export VCP Results CSV",
+                exp_df.to_csv(index=False).encode("utf-8"),
+                file_name=f"vcp_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                mime="text/csv")
+            st.caption("⚠️ VCP works best on liquid leaders in an uptrend. A base forming "
+                       "is not a buy by itself — the classic entry is a breakout ABOVE the "
+                       "pivot on a volume surge. Always confirm before entering.")
+
+# ── Relative Strength Leaders ──────────────────────────────────────────────────
+elif _page == 'rs':
+    st.markdown('<div class="sec">💪 Relative Strength Leaders</div>',
+                unsafe_allow_html=True)
+    st.caption("How each stock performs versus the S&P 500. RS Rating is a 1-99 percentile "
+               "(IBD-style): 80+ = market leader, under 30 = laggard. Leaders tend to "
+               "keep leading — the best longs are high-RS stocks, not cheap laggards.")
+
+    if scan_relative_strength is None:
+        st.warning("⚠️ RS scanner not available — make sure the latest `signals.py` is deployed.")
+    else:
+        rc1, rc2, rc3 = st.columns([1, 1, 1])
+        with rc1:
+            _rs_min = st.slider("Min RS Rating", 0, 99, 70, key="rs_min",
+                                help="80+ = strong leaders. Filter out laggards.")
+        with rc2:
+            _rs_top = st.selectbox("Show top", ["All", "20", "50", "100"], index=2, key="rs_top")
+        with rc3:
+            st.markdown("<br>", unsafe_allow_html=True)
+            _run_rs = st.button("🔍 Rank Universe by RS", width="stretch")
+
+        if _run_rs:
+            top_n = None if _rs_top == "All" else int(_rs_top)
+            with st.spinner("Ranking the universe by relative strength… (takes a minute)"):
+                st.session_state.rs_scan_cache = scan_relative_strength(
+                    top_n=top_n, min_rating=_rs_min)
+
+        rres = st.session_state.get("rs_scan_cache")
+        if rres is None:
+            st.info("Click **Rank Universe by RS** to find the market leaders.")
+        elif rres.get("error"):
+            st.error(f"⚠️ {rres['error']}. S&P 500 data may be temporarily unavailable — try again.")
+        elif not rres.get("leaders"):
+            st.warning(f"No stocks at RS Rating ≥ {_rs_min}. Lower the filter to see more.")
+        else:
+            leaders = rres["leaders"]
+            nifty = rres.get("nifty_returns", {})
+            # S&P 500 benchmark context
+            st.markdown(
+                f'<div style="background:var(--card);border:1px solid var(--border);'
+                f'border-radius:10px;padding:.8rem 1.1rem;margin-bottom:1rem;'
+                f'font-family:\'JetBrains Mono\',monospace;font-size:.82rem;color:var(--muted)">'
+                f'📊 S&P 500 benchmark — 1M: <b style="color:var(--text)">{nifty.get("21",0):+.1f}%</b> · '
+                f'3M: <b style="color:var(--text)">{nifty.get("63",0):+.1f}%</b> · '
+                f'6M: <b style="color:var(--text)">{nifty.get("126",0):+.1f}%</b> · '
+                f'1Y: <b style="color:var(--text)">{nifty.get("252",0):+.1f}%</b></div>',
+                unsafe_allow_html=True)
+
+            st.markdown(f"##### 🏆 {len(leaders)} leaders (RS ≥ {_rs_min}) · "
+                        f"scanned {rres.get('liquid',0)} liquid stocks")
+
+            # ── Top 5 leaders card (already sorted by RS rating desc) ──────────
+            top5 = leaders[:5]
+            if top5:
+                cards = ""
+                for i, l in enumerate(top5, 1):
+                    vcp_mark = "🎯" if l.get("vcp") else ""
+                    cards += (
+                        f'<div style="display:flex;justify-content:space-between;'
+                        f'padding:.5rem .7rem;border-bottom:1px solid var(--border)">'
+                        f'<span><b style="color:var(--accent)">{i}.</b> '
+                        f'<b>{l["stock"]}</b> {vcp_mark} '
+                        f'<span style="color:var(--muted);font-size:.78rem">{l["sector"]}</span></span>'
+                        f'<span style="font-family:monospace;font-size:.82rem">'
+                        f'RS {l["rs_rating"]}/99 · 3M {l.get("ret_63d",0):+.0f}%</span></div>')
+                st.markdown(
+                    f'<div style="background:var(--gradient);border:1px solid var(--accent);'
+                    f'border-radius:12px;padding:1rem 1.2rem;margin-bottom:1.2rem">'
+                    f'<div style="font-size:.8rem;font-weight:800;color:var(--accent);'
+                    f'text-transform:uppercase;letter-spacing:.06em;margin-bottom:.5rem">'
+                    f'⭐ Top 5 Strongest Leaders</div>{cards}'
+                    f'<div style="font-size:.72rem;color:var(--muted);margin-top:.6rem">'
+                    f'Ranked by RS rating. 🎯 = also forming a VCP base. Research '
+                    f'candidates, not buy signals — confirm your entry setup first.</div>'
+                    f'</div>', unsafe_allow_html=True)
+
+            # ── A-TIER OVERLAP: leaders that ALSO have a VCP base (best setups) ──
+            overlap = [l for l in leaders if l.get("vcp")]
+            if overlap:
+                ov_cards = ""
+                for l in overlap[:8]:
+                    rdy = "⚡READY" if l.get("vcp_ready") else "base"
+                    ov_cards += (
+                        f'<div style="display:flex;justify-content:space-between;'
+                        f'padding:.45rem .7rem;border-bottom:1px solid rgba(16,185,129,.2)">'
+                        f'<span><b>{l["stock"]}</b> '
+                        f'<span style="color:var(--muted);font-size:.76rem">{l["sector"]}</span></span>'
+                        f'<span style="font-family:monospace;font-size:.8rem;color:#10b981">'
+                        f'RS {l["rs_rating"]} · VCP {rdy}</span></div>')
+                st.markdown(
+                    f'<div style="background:rgba(16,185,129,.08);border:1px solid #10b981;'
+                    f'border-radius:12px;padding:1rem 1.2rem;margin-bottom:1.2rem">'
+                    f'<div style="font-size:.8rem;font-weight:800;color:#10b981;'
+                    f'text-transform:uppercase;letter-spacing:.06em;margin-bottom:.5rem">'
+                    f'💎 A-Tier Setups — Leader + VCP Base ({len(overlap)})</div>{ov_cards}'
+                    f'<div style="font-size:.72rem;color:var(--muted);margin-top:.6rem">'
+                    f'These appear on BOTH lists: strong RS leadership AND a low-risk VCP '
+                    f'base. This overlap is the classic Minervini setup — your highest-'
+                    f'conviction shortlist. Still confirm the breakout before entering.</div>'
+                    f'</div>', unsafe_allow_html=True)
+
+            # Build a clean table
+            import pandas as _pd
+            tbl = _pd.DataFrame([{
+                "Stock": l["stock"],
+                "RS Rating": l["rs_rating"],
+                "RS Ratio": l["rs_ratio"],
+                "Sector": l["sector"],
+                "CMP": l["cmp"],
+                "1M %": l.get("ret_21d"),
+                "3M %": l.get("ret_63d"),
+                "1Y %": l.get("ret_252d"),
+                "Trend": l.get("trend"),
+                "VCP": "🎯" if l.get("vcp") else "",
+            } for l in leaders])
+            _h = min(max(len(tbl) * 36 + 40, 200), 640)
+            st.dataframe(tbl, width="stretch", height=_h, hide_index=True,
+                         column_config={
+                             "Stock": st.column_config.TextColumn(pinned=True),
+                             "RS Rating": st.column_config.ProgressColumn(
+                                 "RS Rating", min_value=0, max_value=99, format="%d"),
+                         })
+            st.download_button(
+                "⬇️ Export RS Rankings CSV",
+                tbl.to_csv(index=False).encode("utf-8"),
+                file_name=f"rs_leaders_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                mime="text/csv")
+            st.caption("💡 The sweet spot: a high-RS leader (80+) forming a VCP base (🎯) "
+                       "near its pivot. That's the classic Minervini long setup — strength "
+                       "plus a low-risk entry point.")
+
+# ── Post-render background deep scan ───────────────────────────────────────────
+# The ENTIRE page has now rendered — you can see and interact with everything.
+# Only NOW do we run one deep-scan stage (silently, in the background), then
+# trigger a gentle rerun to advance to the next stage. Because this happens AFTER
+# render, your current page/scroll/inputs are never interrupted mid-view.
+if st.session_state.get("_run_deep_now", False):
+    st.session_state._run_deep_now = False
+    _stage = st.session_state.get("_deep_stage", "sector")
+    st.session_state._deep_progress = _stage
+
+    if _stage == "sector":
+        try:
+            st.session_state.sector_cache = sector_rotation()
+            if (st.session_state.sector_cache is not None and
+                    not st.session_state.sector_cache.empty):
+                st.session_state.outlook_cache = predict_sector_outlook(
+                    st.session_state.sector_cache)
+                st.session_state.picks_cache = find_sector_picks(
+                    st.session_state.sector_cache.head(5)["sector"].tolist(), 3)
+            else:
+                st.session_state.outlook_cache = pd.DataFrame()
+                st.session_state.picks_cache   = []
+        except Exception:
+            pass
+        st.session_state._deep_stage = "universe"
+
+    elif _stage == "universe":
+        try:
+            _usd = generate_market_scanner()
+            st.session_state.scanner_cache = (
+                _usd if (_usd is not None and not _usd.empty) else pd.DataFrame())
+        except Exception:
+            pass
+        st.session_state._deep_stage = "smc"
+
+    elif _stage == "smc":
+        try:
+            if scan_for_smc_setups is not None:
+                st.session_state.smc_scan_cache = scan_for_smc_setups(
+                    min_quality="B", action_filter="All")
+        except Exception:
+            pass
+        st.session_state._deep_stage = "traps"
+
+    elif _stage == "traps":
+        try:
+            if scan_for_traps is not None:
+                st.session_state.trap_scan_cache = scan_for_traps(min_confidence=55)
+        except Exception:
+            pass
+        st.session_state._deep_stage = "vcp"
+
+    elif _stage == "vcp":
+        try:
+            if scan_for_vcp is not None:
+                st.session_state.vcp_scan_cache = scan_for_vcp(
+                    min_quality="B", ready_only=False)
+        except Exception:
+            pass
+        st.session_state._deep_stage = "rs"
+
+    elif _stage == "rs":
+        try:
+            if scan_relative_strength is not None:
+                st.session_state.rs_scan_cache = scan_relative_strength(
+                    top_n=None, min_rating=0)
+        except Exception:
+            pass
+        st.session_state._deep_stage = "sector"        # reset for next cycle
+        st.session_state._deep_running = False          # whole sequence complete
+        st.session_state._deep_progress = "done"
+        st.session_state.last_slow_scan = time.time()   # mark deep scan complete
+
+    # Advance to the next stage on the next pass. If the sequence is still
+    # running, gently rerun; otherwise stop (no more forced reruns).
+    if st.session_state.get("_deep_running", False):
+        time.sleep(0.05)
+        st.rerun()
+
+# ── First-paint kickoff (login) ────────────────────────────────────────────────
+# On first login, trigger one rerun so the deferred fast/deep scans begin.
+if st.session_state.get("_kickoff_scan", False):
+    st.session_state._kickoff_scan = False
+    time.sleep(0.1)
+    st.rerun()
