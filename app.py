@@ -237,12 +237,39 @@ DB = "trades_us.db"   # SQLite store for the US app (its OWN DB, separate from N
 # ── DATABASE CONNECTION ───────────────────────────────────────────────────────
 # Postgres (e.g. Neon) is OPTIONAL. Provide credentials via Streamlit secrets or
 # environment variables; if none are found the app uses local SQLite (DB above).
-# In Streamlit Cloud → Settings → Secrets, add a [postgres] section:
-#   [postgres]
-#   host="..."  port=5432  dbname="..."  user="..."  password="..."  sslmode="require"
-# IMPORTANT: use a SEPARATE database from the NSE app so US/NSE trades never mix.
+# Preferred: add a single DATABASE_URL secret in Streamlit Cloud → Settings → Secrets:
+#   DATABASE_URL = "postgresql://USER:PASSWORD@HOST/DBNAME?sslmode=require"
+# (A [postgres] section or PG_* env vars are also accepted.)
+#
+# DATA ISOLATION: the US app keeps ALL its tables in a dedicated schema
+# (_PG_SCHEMA below). This lets it safely share the SAME Neon database as the
+# NSE app without their users/trades ever colliding — NSE lives in `public`,
+# the US app lives in `us_swing`.
+_PG_SCHEMA = "us_swing"
+
 def _load_pg_params():
     import os
+    from urllib.parse import urlparse, parse_qs
+    # 1) DATABASE_URL — single connection string (secrets, then env)
+    url = None
+    try:
+        url = st.secrets.get("DATABASE_URL", None)
+    except Exception:
+        url = None
+    url = url or os.environ.get("DATABASE_URL")
+    if url:
+        u = urlparse(url)
+        q = parse_qs(u.query)
+        return dict(
+            host            = u.hostname,
+            port            = u.port or 5432,
+            dbname          = (u.path or "/neondb").lstrip("/") or "neondb",
+            user            = u.username,
+            password        = u.password,
+            sslmode         = q.get("sslmode", ["require"])[0],
+            connect_timeout = 15,
+        )
+    # 2) [postgres] section / PG_* env vars
     try:
         sec = st.secrets.get("postgres", None)
     except Exception:
@@ -280,6 +307,12 @@ def _pg_conn():
         try:
             conn = psycopg2.connect(**_PG_PARAMS)
             conn.autocommit = False
+            # Ensure the US schema exists and scope this session to it, so the
+            # US app never reads/writes the NSE app's public.* tables.
+            with conn.cursor() as _c:
+                _c.execute(f"CREATE SCHEMA IF NOT EXISTS {_PG_SCHEMA}")
+                _c.execute(f"SET search_path TO {_PG_SCHEMA}")
+            conn.commit()
             return conn
         except Exception as e:
             last_err = e
@@ -314,7 +347,7 @@ def db(sql, params=(), fetch=False):
         # Neon fully supports search_path (unlike Supabase pooler). Set it so
         # bare table names resolve to public.* — this is the standard approach.
         try:
-            cur.execute("SET search_path TO public")
+            cur.execute(f"SET search_path TO {_PG_SCHEMA}")
         except Exception:
             pass
         # Also qualify explicitly as belt-and-suspenders.
@@ -342,7 +375,7 @@ def init_db():
     if _USE_PG:
         conn = _pg_conn(); cur = conn.cursor()
         try:
-            cur.execute("SET search_path TO public")
+            cur.execute(f"SET search_path TO {_PG_SCHEMA}")
             conn.commit()
         except Exception:
             conn.rollback()
@@ -439,7 +472,7 @@ def get_trades(user_id):
     if _USE_PG:
         conn = _pg_conn()
         try:
-            cur = conn.cursor(); cur.execute("SET search_path TO public"); cur.close()
+            cur = conn.cursor(); cur.execute(f"SET search_path TO {_PG_SCHEMA}"); cur.close()
         except Exception:
             pass
         df = pd.read_sql_query(
@@ -458,7 +491,7 @@ def get_history(user_id):
     if _USE_PG:
         conn = _pg_conn()
         try:
-            cur = conn.cursor(); cur.execute("SET search_path TO public"); cur.close()
+            cur = conn.cursor(); cur.execute(f"SET search_path TO {_PG_SCHEMA}"); cur.close()
         except Exception:
             pass
         df = pd.read_sql_query(
@@ -477,7 +510,7 @@ def get_watchlist(user_id):
     if _USE_PG:
         conn = _pg_conn()
         try:
-            cur = conn.cursor(); cur.execute("SET search_path TO public"); cur.close()
+            cur = conn.cursor(); cur.execute(f"SET search_path TO {_PG_SCHEMA}"); cur.close()
         except Exception:
             pass
         df = pd.read_sql_query(
@@ -994,9 +1027,9 @@ table.t tr.row-loss td   {{ box-shadow: inset 3px 0 0 var(--red); }}
     background: var(--card); border: 1px solid var(--border); border-radius: 16px;
     padding: 1.5rem; transition: all .3s ease; backdrop-filter: blur(16px);
     box-shadow: 0 10px 20px -5px rgba(0,0,0,0.35);
-    animation: card-in .45s ease both;
+    animation: card-in .28s ease both;
 }}
-@keyframes card-in {{ from {{ opacity: 0; transform: translateY(12px); }} to {{ opacity: 1; transform: none; }} }}
+@keyframes card-in {{ from {{ transform: translateY(8px); }} to {{ transform: none; }} }}
 .sig-card:hover, .pick-card:hover {{
     transform: translateY(-5px); border-color: var(--accent);
     box-shadow: 0 18px 36px -8px rgba(0,0,0,0.55), 0 0 20px var(--glow);
@@ -1978,6 +2011,24 @@ with st.sidebar:
             '🟡 Local storage (data resets on restart). '
             'Add DATABASE_URL to persist.</div>',
             unsafe_allow_html=True)
+
+    # ── Scan depth (coverage vs speed) ─────────────────────────────────────────
+    # Controls how many of the most-liquid symbols EVERY scanner sweeps. Custom
+    # tickers (us_custom.csv) and all ETFs are always included on top of this.
+    import signals as _sig_mod
+    _depth_opts = {
+        "⚡ Fast — top 600":            600,
+        "⚖️ Balanced — top 1,500":      1500,
+        "🔭 Deep — top 3,000":          3000,
+        f"🌌 Max — all {UNIVERSE_TOTAL:,}": UNIVERSE_TOTAL,
+    }
+    _depth_label = st.selectbox(
+        "🔍 Scan depth", list(_depth_opts.keys()), index=1,
+        help="How many of the most-liquid symbols each scanner sweeps. Your "
+             "custom tickers and all ETFs are always scanned regardless. Higher = "
+             "broader coverage but slower; very large scans can be rate-limited by Yahoo.")
+    MAX_SCAN_SYMBOLS = _depth_opts[_depth_label]   # rebinds app-level name (display)
+    _sig_mod.MAX_SCAN_SYMBOLS = MAX_SCAN_SYMBOLS    # drives signals.get_scan_symbols()
 
     if st.button("🚪 Logout", width="stretch"):
         controller.set("swing_user_id", "", max_age=0)
