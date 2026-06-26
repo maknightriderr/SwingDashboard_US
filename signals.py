@@ -3304,72 +3304,182 @@ def scan_relative_strength(top_n=None, min_rating=0):
     }
 
 
+
 # ==============================================================================
-#  MARKET THEMES — trending thematic baskets (AI, EV, semis, nuclear, …)
+#  MARKET THEMES — classify the FULL universe into trending baskets
 # ==============================================================================
-# Curated liquid constituents + representative ETFs per theme. Edit freely:
-# add/remove tickers or whole themes. Symbols must resolve on Yahoo (bare US).
-THEMES = {
-    "🤖 Artificial Intelligence": [
-        "NVDA", "MSFT", "GOOGL", "META", "AMD", "AVGO", "PLTR", "SMCI", "MU",
-        "TSM", "ARM", "SNOW", "NOW", "ORCL", "CRM", "AI", "BBAI",
-        "AIQ", "BOTZ", "IGV",            # ETFs
-    ],
-    "💾 Semiconductors": [
-        "NVDA", "AMD", "AVGO", "TSM", "MU", "ASML", "AMAT", "LRCX", "KLAC",
-        "QCOM", "INTC", "MRVL", "ARM", "TXN", "ON", "MCHP",
-        "SMH", "SOXX", "SOXL",           # ETFs
-    ],
-    "⚡ Electric Vehicles": [
-        "TSLA", "RIVN", "LCID", "NIO", "XPEV", "LI", "GM", "F", "BYDDY",
-        "DRIV", "IDRV", "KARS",          # ETFs
-    ],
-    "🔋 Battery & Lithium": [
-        "ALB", "SQM", "LAC", "PLL", "ENVX", "QS", "FREY", "AMPX",
-        "LIT", "BATT",                   # ETFs
-    ],
-    "☢️ Nuclear & Uranium": [
-        "CCJ", "LEU", "OKLO", "SMR", "NNE", "UEC", "DNN", "UUUU", "BWXT",
-        "URA", "URNM", "NLR",            # ETFs
-    ],
-    "🌞 Clean Energy & Solar": [
-        "FSLR", "ENPH", "SEDG", "RUN", "NEE", "BE", "SHLS", "ARRY",
-        "ICLN", "TAN", "PBW",            # ETFs
-    ],
-    "☁️ Cloud & Software": [
-        "MSFT", "CRM", "NOW", "SNOW", "DDOG", "NET", "ORCL", "ADBE", "PANW",
-        "MDB", "TEAM", "WDAY",
-        "IGV", "SKYY", "WCLD",           # ETFs
-    ],
-    "🛡️ Cybersecurity": [
-        "PANW", "CRWD", "ZS", "FTNT", "S", "OKTA", "NET", "CYBR", "QLYS",
-        "CIBR", "HACK", "BUG",           # ETFs
-    ],
-    "🤖 Robotics & Automation": [
-        "ISRG", "ABB", "ROK", "TER", "NVDA", "PATH", "ZBRA", "EMR",
-        "BOTZ", "ROBO", "ARKQ",          # ETFs
-    ],
-    "🛰️ Space & Defense": [
-        "LMT", "RTX", "NOC", "GD", "LHX", "RKLB", "ASTS", "LUNR", "BA",
-        "ITA", "PPA", "ARKX",            # ETFs
-    ],
-    "💊 Biotech & GLP-1": [
-        "LLY", "NVO", "AMGN", "VRTX", "REGN", "MRNA", "GILD", "BIIB", "VKTX",
-        "XBI", "IBB", "ARKG",            # ETFs
-    ],
-    "💳 Fintech & Crypto": [
-        "COIN", "HOOD", "XYZ", "PYPL", "SOFI", "MSTR", "MARA", "RIOT", "AFRM",
-        "FINX", "ARKF", "BITQ",          # ETFs
-    ],
-    "🏗️ Data Center & Power": [
-        "VRT", "ETN", "NVDA", "DLR", "EQIX", "SMCI", "ANET", "PWR", "GEV",
-        "PAVE", "DTCR",                  # ETFs
-    ],
-    "🧬 Quantum Computing": [
-        "IONQ", "RGTI", "QBTS", "QUBT", "IBM", "ARQQ",
-        "QTUM",                          # ETF
-    ],
+# Each theme is a RULE applied to every symbol in the universe (not a hand-picked
+# list). Membership = union of:
+#   seeds       — tickers that always belong (mega-caps that keywords miss) + ETFs
+#   industry_kw — substring(s) matched against the symbol's Industry
+#   name_kw     — substring(s) matched against the company Name
+#   sector_kw   — optional substring(s) matched against Sector
+# So each theme draws from all ~6,900 names, surfacing the long tail too.
+
+THEME_RULES = {
+    "🤖 Artificial Intelligence": {
+        "seeds": ["NVDA","MSFT","GOOGL","GOOG","META","AMD","AVGO","PLTR","SMCI","ARM",
+                  "SNOW","NOW","ORCL","CRM","AAPL","TSM","MU","DELL","ANET","VRT","AI","BBAI",
+                  "AIQ","BOTZ","IGV","QQQ"],
+        "name_kw": ["artificial intelligence"],
+        "industry_kw": [],
+    },
+    "💾 Semiconductors": {
+        "seeds": ["SMH","SOXX","SOXL"],
+        "name_kw": ["semiconductor"],
+        "industry_kw": ["semiconductor"],
+    },
+    "☁️ Cloud & Software": {
+        "seeds": ["MSFT","CRM","NOW","SNOW","DDOG","NET","ORCL","ADBE","MDB","TEAM","WDAY",
+                  "IGV","SKYY","WCLD"],
+        "name_kw": ["software","cloud"],
+        "industry_kw": ["computer software","edp services","programming data processing"],
+    },
+    "🛡️ Cybersecurity": {
+        "seeds": ["PANW","CRWD","ZS","FTNT","S","OKTA","NET","CYBR","QLYS","RPD","TENB","VRNS",
+                  "CIBR","HACK","BUG"],
+        "name_kw": ["cyber"],
+        "industry_kw": [],
+    },
+    "⚡ Electric Vehicles": {
+        "seeds": ["TSLA","RIVN","LCID","NIO","XPEV","LI","GM","F","BYDDY","FFIE","GOEV",
+                  "PSNY","ZK","LOT","DRIV","IDRV","KARS"],
+        "name_kw": ["electric vehicle"],
+        "industry_kw": [],
+    },
+    "🔋 Battery & Lithium": {
+        "seeds": ["ALB","SQM","LAC","PLL","ENVX","QS","FREY","AMPX","MVST","SLDP",
+                  "LIT","BATT"],
+        "name_kw": ["lithium","battery"],
+        "industry_kw": [],
+    },
+    "☢️ Nuclear & Uranium": {
+        "seeds": ["CCJ","LEU","OKLO","SMR","NNE","UEC","DNN","UUUU","BWXT","NXE",
+                  "URA","URNM","NLR"],
+        "name_kw": ["uranium","nuclear"],
+        "industry_kw": [],
+    },
+    "🌞 Clean Energy & Solar": {
+        "seeds": ["FSLR","ENPH","SEDG","RUN","NEE","BE","SHLS","ARRY","NOVA","CSIQ",
+                  "ICLN","TAN","PBW"],
+        "name_kw": ["solar","renewable","clean energy","hydrogen","fuel cell"],
+        "industry_kw": [],
+    },
+    "🛢️ Oil & Gas / Energy": {
+        "seeds": ["XOM","CVX","COP","SLB","EOG","OXY","PSX","MPC","WMB","KMI",
+                  "XLE","XOP","OIH"],
+        "name_kw": [],
+        "industry_kw": ["oil & gas","oil refining","natural gas","coal mining","integrated oil"],
+    },
+    "🤖 Robotics & Automation": {
+        "seeds": ["ISRG","ABB","ROK","TER","NVDA","PATH","ZBRA","EMR","SYM","NDSN",
+                  "BOTZ","ROBO","ARKQ"],
+        "name_kw": ["robot","automation"],
+        "industry_kw": [],
+    },
+    "🛰️ Space & Defense": {
+        "seeds": ["LMT","RTX","NOC","GD","LHX","RKLB","ASTS","LUNR","BA","KTOS","AVAV","RDW",
+                  "ITA","PPA","ARKX"],
+        "name_kw": ["aerospace","defense","space"],
+        "industry_kw": ["military/government/technical","aerospace"],
+    },
+    "💊 Biotech & Pharma": {
+        "seeds": ["LLY","NVO","AMGN","VRTX","REGN","MRNA","GILD","BIIB","VKTX",
+                  "XBI","IBB","ARKG"],
+        "name_kw": ["biotech","therapeutic","pharmaceutic"],
+        "industry_kw": ["biotechnology","pharmaceutical","major pharmaceuticals","medicinal"],
+    },
+    "💳 Fintech & Crypto": {
+        "seeds": ["COIN","HOOD","XYZ","PYPL","SOFI","MSTR","MARA","RIOT","AFRM","CLSK","BMNR",
+                  "FINX","ARKF","BITQ"],
+        "name_kw": ["bitcoin","crypto","blockchain","digital asset","fintech"],
+        "industry_kw": [],
+    },
+    "🧬 Quantum Computing": {
+        "seeds": ["IONQ","RGTI","QBTS","QUBT","IBM","ARQQ","QTUM"],
+        "name_kw": ["quantum"],
+        "industry_kw": [],
+    },
+    "🏗️ Data Center & Power": {
+        "seeds": ["VRT","ETN","NVDA","DLR","EQIX","SMCI","ANET","PWR","GEV","CEG","VST","TLN",
+                  "PAVE","DTCR"],
+        "name_kw": ["data center"],
+        "industry_kw": [],
+    },
 }
+
+# How many of the most-liquid (market-cap-ordered) members each theme scans live.
+THEME_SCAN_PER = 80
+
+
+def _load_theme_meta():
+    """Ordered [{sym,name,sector,industry}] for theme classification.
+    Reads us_custom.csv first, then the liquid/full universe — market-cap order
+    preserved, so the first members of each theme are the most liquid."""
+    meta, seen = [], set()
+    files = []
+    if os.path.exists(os.path.join(_BASE_DIR, "us_custom.csv")):
+        files.append("us_custom.csv")
+    files.append("us_universe_liquid.csv"
+                 if os.path.exists(os.path.join(_BASE_DIR, "us_universe_liquid.csv"))
+                 else "us_universe.csv")
+    for fn in files:
+        try:
+            df = pd.read_csv(os.path.join(_BASE_DIR, fn))
+        except Exception:
+            continue
+        cols = {c.lower(): c for c in df.columns}
+        sc = cols.get("symbol") or cols.get("ticker")
+        nc = cols.get("name", sc)
+        sec = cols.get("sector")
+        ic = cols.get("industry")
+        if not sc:
+            continue
+        for _, r in df.iterrows():
+            sym = str(r[sc]).strip().upper()
+            if not sym or sym in seen:
+                continue
+            seen.add(sym)
+            meta.append({
+                "sym": sym,
+                "name": str(r[nc]).strip() if nc else sym,
+                "sector": str(r[sec]).strip() if sec else "",
+                "industry": str(r[ic]).strip() if ic else "",
+            })
+    return meta
+
+
+def _classify_universe():
+    """Assign every universe symbol to all themes it matches (union of rules)."""
+    meta = _load_theme_meta()
+    members = {t: [] for t in THEME_RULES}
+    seeds = {t: set(r.get("seeds", [])) for t, r in THEME_RULES.items()}
+    for row in meta:                       # market-cap order
+        sym = row["sym"]
+        name = row["name"].lower()
+        ind = row["industry"].lower()
+        sec = row["sector"].lower()
+        for theme, rule in THEME_RULES.items():
+            hit = sym in seeds[theme]
+            if not hit:
+                hit = any(kw in ind for kw in rule.get("industry_kw", []))
+            if not hit:
+                hit = any(kw in name for kw in rule.get("name_kw", []))
+            if not hit:
+                hit = any(kw in sec for kw in rule.get("sector_kw", []))
+            if hit:
+                members[theme].append(sym)
+    return members
+
+
+# Built once at import — instant, no network. {theme: [symbols, most-liquid-first]}
+try:
+    THEME_MEMBERS = _classify_universe()
+except Exception:
+    THEME_MEMBERS = {t: list(r.get("seeds", [])) for t, r in THEME_RULES.items()}
+
+# Back-compat: THEMES used to be a {name: [symbols]} dict.
+THEMES = THEME_MEMBERS
 
 
 def _period_returns(df):
@@ -3388,21 +3498,20 @@ def _period_returns(df):
         return None, None
 
 
-def scan_themes(liquid_only=True):
-    """Scan all THEMES, returning each theme's liquid members with live metrics
-    plus an aggregate momentum score, sorted hottest-first.
+def scan_themes(liquid_only=True, per_theme=None):
+    """Scan every theme across the full classified universe (most-liquid names
+    per theme), returning each theme's members with live metrics plus an
+    aggregate 1-month momentum, sorted hottest-first.
 
-    Returns:
-        {
-          "themes": [ { name, members:[...], count, avg_ret_1m, avg_ret_1w,
-                        breadth_up, leader }, ... ],   # sorted by avg_ret_1m desc
-          "scanned": int, "timestamp": str,
-        }
-    Each member: stock, is_etf, sector, cmp, rsi, trend, ret_1w, ret_1m,
-                 rs_ratio, vol_ratio, above_ema50, signal
+    per_theme caps how many of each theme's most-liquid members are fetched
+    live (default THEME_SCAN_PER) — this keeps the live scan bounded even though
+    classification spans the whole universe.
     """
-    # One bulk fetch across all unique theme symbols (small, bounded set).
-    symbols = sorted({s for members in THEMES.values() for s in members})
+    cap = THEME_SCAN_PER if per_theme is None else per_theme
+
+    # Per-theme most-liquid slice, then one bulk fetch over the dedup'd union.
+    sliced = {t: (m[:cap] if cap else m) for t, m in THEME_MEMBERS.items()}
+    symbols = sorted({s for m in sliced.values() for s in m})
     bulk = _bulk_fetch_history(symbols, period="6mo")
 
     ind_cache, ret_cache = {}, {}
@@ -3417,9 +3526,9 @@ def scan_themes(liquid_only=True):
             ret_cache[s] = _period_returns(df) if df is not None else (None, None)
 
     themes_out = []
-    for name, members in THEMES.items():
+    for name, member_syms in sliced.items():
         rows = []
-        for s in members:
+        for s in member_syms:
             ind = ind_cache.get(s)
             if not ind:
                 continue
@@ -3429,7 +3538,6 @@ def scan_themes(liquid_only=True):
             ema50 = ind.get("ema50")
             cmp = ind.get("cmp")
             above_ema50 = bool(cmp and ema50 and cmp > ema50)
-            # lightweight signal label
             tr = ind.get("trend", "")
             if "Uptrend" in tr and above_ema50:
                 sig = "🟢 Strong" if "Strong" in tr else "🟢 Up"
@@ -3438,18 +3546,11 @@ def scan_themes(liquid_only=True):
             else:
                 sig = "🟡 Neutral"
             rows.append({
-                "stock":       s,
-                "is_etf":      _is_etf(s),
-                "sector":      get_sector(s),
-                "cmp":         cmp,
-                "rsi":         ind.get("rsi"),
-                "trend":       tr,
-                "ret_1w":      r1w,
-                "ret_1m":      r1m,
-                "rs_ratio":    ind.get("rs_ratio"),
-                "vol_ratio":   ind.get("vol_ratio"),
-                "above_ema50": above_ema50,
-                "signal":      sig,
+                "stock": s, "is_etf": _is_etf(s), "sector": get_sector(s),
+                "cmp": cmp, "rsi": ind.get("rsi"), "trend": tr,
+                "ret_1w": r1w, "ret_1m": r1m, "rs_ratio": ind.get("rs_ratio"),
+                "vol_ratio": ind.get("vol_ratio"), "above_ema50": above_ema50,
+                "signal": sig,
             })
         if not rows:
             continue
@@ -3461,18 +3562,14 @@ def scan_themes(liquid_only=True):
         rows.sort(key=lambda r: (r["ret_1m"] if r["ret_1m"] is not None else -999),
                   reverse=True)
         themes_out.append({
-            "name":        name,
-            "members":     rows,
-            "count":       len(rows),
-            "avg_ret_1m":  avg_1m,
-            "avg_ret_1w":  avg_1w,
-            "breadth_up":  breadth,
-            "leader":      rows[0]["stock"] if rows else "—",
+            "name": name, "members": rows, "count": len(rows),
+            "avg_ret_1m": avg_1m, "avg_ret_1w": avg_1w, "breadth_up": breadth,
+            "leader": rows[0]["stock"] if rows else "—",
         })
 
     themes_out.sort(key=lambda t: t["avg_ret_1m"], reverse=True)
     return {
-        "themes":    themes_out,
-        "scanned":   len(symbols),
+        "themes": themes_out,
+        "scanned": len(symbols),
         "timestamp": datetime.now().strftime("%d %b %Y %H:%M"),
     }
