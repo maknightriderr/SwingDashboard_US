@@ -1401,26 +1401,26 @@ ul[role="listbox"] li[aria-selected="true"] {{
 @media (prefers-reduced-motion: reduce) {{
     *, ::before, ::after {{ animation: none !important; transition: none !important; }}
 }}
-/* ═══ Popover nav triggers — keep section labels visible on every theme ═══ */
-/* button[aria-haspopup] targets ONLY the section trigger buttons (Portfolio,
-   Signals, …), never the page buttons inside the open panel. */
-[data-testid="stSidebar"] button[aria-haspopup],
-[data-testid="stSidebar"] button[aria-haspopup] p,
-[data-testid="stSidebar"] button[aria-haspopup] span,
-[data-testid="stSidebar"] button[aria-haspopup] div {{
+/* ═══ Popover nav triggers — force section labels visible on every theme ═══ */
+/* Matches any popover-related element (stPopover / stPopoverButton / etc.)
+   inside the sidebar, whether the testid is on the button or its wrapper.
+   The open panel's page buttons are portaled to <body>, so only the section
+   triggers (Portfolio, Signals, …) are affected. */
+[data-testid="stSidebar"] button[data-testid*="Popover"],
+[data-testid="stSidebar"] button[data-testid*="Popover"] *,
+[data-testid="stSidebar"] [data-testid*="Popover"] button,
+[data-testid="stSidebar"] [data-testid*="Popover"] button *,
+[data-testid="stSidebar"] [class*="Popover"] button,
+[data-testid="stSidebar"] [class*="Popover"] button * {{
     color: var(--text) !important;
+    fill: var(--text) !important;
     font-weight: 700 !important;
 }}
-[data-testid="stSidebar"] button[aria-haspopup] {{
+[data-testid="stSidebar"] button[data-testid*="Popover"],
+[data-testid="stSidebar"] [data-testid*="Popover"] button,
+[data-testid="stSidebar"] [class*="Popover"] button {{
     background: var(--card2) !important;
     border: 1px solid var(--border) !important;
-}}
-[data-testid="stSidebar"] button[aria-haspopup]:hover {{
-    border-color: var(--accent) !important;
-}}
-[data-testid="stSidebar"] button[aria-haspopup]:hover p,
-[data-testid="stSidebar"] button[aria-haspopup]:hover span {{
-    color: var(--accent) !important;
 }}
 </style>
 """
