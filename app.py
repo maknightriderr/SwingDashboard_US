@@ -888,6 +888,61 @@ THEMES = {
         "glow": "rgba(20, 184, 166, 0.20)",
         "bg_fx": "radial-gradient(ellipse 70% 45% at 50% -15%, rgba(20,184,166,0.05), transparent)",
     },
+  # ── 7. Porcelain & Gold — private-bank light, warm ivory + deep gold ──────
+    "Porcelain & Gold (Private Bank)": {
+        "bg": "#f6f5f1", "card": "rgba(255, 255, 255, 0.85)", "input": "#ffffff",
+        "border": "rgba(20, 33, 61, 0.12)",
+        "text": "#14213d", "muted": "#6b7280",
+        "green": "#059669", "red": "#dc2626", "yellow": "#b45309",
+        "blue": "#1d4ed8", "accent": "#b8860b", "card2": "#efeee9",
+        "gradient": "linear-gradient(145deg, rgba(184,134,11,0.06) 0%, rgba(255,255,255,0.92) 40%, #f6f5f1 100%)",
+        "glow": "rgba(184, 134, 11, 0.18)",
+        "bg_fx": "radial-gradient(ellipse 80% 50% at 50% -20%, rgba(184,134,11,0.05), transparent)",
+    },
+    # ── 8. Pearl & Emerald — wealth-desk light, cool pearl + sage emerald ─────
+    "Pearl & Emerald (Atelier)": {
+        "bg": "#f4f6f4", "card": "rgba(255, 255, 255, 0.82)", "input": "#ffffff",
+        "border": "rgba(15, 82, 66, 0.12)",
+        "text": "#1f2a24", "muted": "#6b7c74",
+        "green": "#0f9d58", "red": "#d93838", "yellow": "#c08a00",
+        "blue": "#2563eb", "accent": "#0f6e56", "card2": "#eaf0ec",
+        "gradient": "linear-gradient(150deg, rgba(15,110,86,0.06) 0%, rgba(255,255,255,0.92) 40%, #f4f6f4 100%)",
+        "glow": "rgba(15, 110, 86, 0.16)",
+        "bg_fx": "radial-gradient(ellipse 75% 50% at 50% -15%, rgba(15,110,86,0.05), transparent)",
+    },
+    # ── 9. Platinum & Slate — quant light, cool platinum + clean blue ─────────
+    "Platinum & Slate (Quant Light)": {
+        "bg": "#f2f4f7", "card": "rgba(255, 255, 255, 0.85)", "input": "#ffffff",
+        "border": "rgba(30, 41, 59, 0.12)",
+        "text": "#0f172a", "muted": "#64748b",
+        "green": "#059669", "red": "#e11d48", "yellow": "#d97706",
+        "blue": "#0284c7", "accent": "#2563eb", "card2": "#e9edf2",
+        "gradient": "linear-gradient(135deg, rgba(37,99,235,0.06) 0%, rgba(255,255,255,0.92) 45%, #f2f4f7 100%)",
+        "glow": "rgba(37, 99, 235, 0.16)",
+        "bg_fx": "radial-gradient(ellipse 60% 40% at 20% -10%, rgba(37,99,235,0.06), transparent), radial-gradient(ellipse 50% 35% at 90% 10%, rgba(2,132,199,0.04), transparent)",
+    },
+    # ── 10. Midnight Burgundy — reserve dark, wine + crimson accent ───────────
+    "Midnight Burgundy (Reserve)": {
+        "bg": "#0c0608", "card": "rgba(22, 12, 16, 0.85)", "input": "#1c1014",
+        "border": "rgba(190, 18, 60, 0.20)",
+        "text": "#fbf7f8", "muted": "#9a8a8e",
+        "green": "#10b981", "red": "#fb7185", "yellow": "#e8b04b",
+        "blue": "#60a5fa", "accent": "#c2334d", "card2": "#1a0e12",
+        "gradient": "linear-gradient(145deg, rgba(190,18,60,0.05) 0%, rgba(22,12,16,0.95) 35%, #0c0608 100%)",
+        "glow": "rgba(190, 18, 60, 0.22)",
+        "bg_fx": "radial-gradient(ellipse 80% 50% at 50% -20%, rgba(190,18,60,0.07), transparent)",
+    },
+    # ── 11. Graphite & Copper — foundry dark, graphite + warm copper ──────────
+    "Graphite & Copper (Foundry)": {
+        "bg": "#0c0d0f", "card": "rgba(20, 21, 24, 0.88)", "input": "#1a1c1f",
+        "border": "rgba(205, 127, 80, 0.16)",
+        "text": "#f5f3f0", "muted": "#9b9690",
+        "green": "#34d399", "red": "#f87171", "yellow": "#e0a458",
+        "blue": "#60a5fa", "accent": "#cd7f50", "card2": "#141518",
+        "gradient": "linear-gradient(150deg, rgba(205,127,80,0.05) 0%, rgba(20,21,24,0.94) 40%, #0c0d0f 100%)",
+        "glow": "rgba(205, 127, 80, 0.20)",
+        "bg_fx": "radial-gradient(ellipse 75% 50% at 50% -15%, rgba(205,127,80,0.06), transparent)",
+    },
 }
 
 # --- Fail-safe to prevent KeyErrors when a saved theme name no longer exists ---
@@ -2121,13 +2176,12 @@ with st.sidebar:
         st.session_state.active_page = "portfolio"
 
     # Group headers + radio buttons styled with CSS
-    # Two-level nav (Option B): each section is an expander; pages are
-    # buttons inside. The section holding the current page auto-expands,
-    # and the current page renders as a highlighted (primary) button.
+    # Popover nav: each section is a popover button; its pages live inside the
+    # floating panel. Click a section to open it, then click a page. The current
+    # page renders as a highlighted (primary) button.
     cur_page = st.session_state.active_page
     for group_label, items in NAV_GROUPS.items():
-        has_current = any(k == cur_page for _, k in items)
-        with st.expander(group_label, expanded=has_current):
+        with st.popover(group_label, use_container_width=True):
             for label, key in items:
                 if st.button(label, key=f"nav_{key}", width="stretch",
                              type=("primary" if key == cur_page else "secondary")):
