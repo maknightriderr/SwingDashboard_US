@@ -1139,6 +1139,14 @@ table.t tr.row-loss td   {{ box-shadow: inset 3px 0 0 var(--red); }}
 .news-item:hover {{ border-left-width: 6px; background: var(--input); }}
 
 /* ═══ Sidebar, inputs, buttons ═══ */
+[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] div,
+[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p,
+[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] span,
+[data-testid="stSidebar"] .stMarkdown div,
+[data-testid="stSidebar"] .stMarkdown p,
+[data-testid="stSidebar"] .stMarkdown span {{
+    color: var(--text);
+}}
 [data-testid="stSidebar"] {{
     background: var(--card) !important; border-right: 1px solid var(--border);
     padding-top: 1rem;
