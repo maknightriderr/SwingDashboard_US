@@ -2121,24 +2121,18 @@ with st.sidebar:
         st.session_state.active_page = "portfolio"
 
     # Group headers + radio buttons styled with CSS
-    nav_html = ""
-    flat_idx = 0
+    # Two-level nav (Option B): each section is an expander; pages are
+    # buttons inside. The section holding the current page auto-expands,
+    # and the current page renders as a highlighted (primary) button.
+    cur_page = st.session_state.active_page
     for group_label, items in NAV_GROUPS.items():
-        nav_html += (f'<div style="font-size:.65rem;font-weight:800;color:var(--muted);'
-                     f'text-transform:uppercase;letter-spacing:.1em;margin:.6rem 0 .2rem;'
-                     f'padding-left:.3rem">{group_label}</div>')
-        flat_idx += len(items)
-
-    # Use radio for actual selection (CSS handles grouping visually)
-    cur_idx = nav_keys.index(st.session_state.active_page) \
-              if st.session_state.active_page in nav_keys else 0
-    sel_nav = st.radio(
-        "nav", nav_labels, index=cur_idx,
-        label_visibility="collapsed")
-    new_page = nav_keys[nav_labels.index(sel_nav)]
-    if new_page != st.session_state.active_page:
-        st.session_state.active_page = new_page
-        st.rerun()
+        has_current = any(k == cur_page for _, k in items)
+        with st.expander(group_label, expanded=has_current):
+            for label, key in items:
+                if st.button(label, key=f"nav_{key}", width="stretch",
+                             type=("primary" if key == cur_page else "secondary")):
+                    st.session_state.active_page = key
+                    st.rerun()
 
     st.markdown("<br>", unsafe_allow_html=True)
     st.markdown('<div style="font-size:1.1rem;font-weight:800;color:var(--accent);'
